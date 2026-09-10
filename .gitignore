@@ -1,0 +1,6 @@
+node_modules
+dist
+
+# Real HubSpot exports contain contact PII (names, phone, email, address) --
+# never commit these. The app works on whatever you drop in the UI at runtime.
+docs/
