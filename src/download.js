@@ -33,8 +33,9 @@ export function downloadCsv({ headers, rows }, filename) {
  */
 export function annotateWorkbook({ headers, rows, highlights, addedHeaders, targetHeaders, source }) {
   const ws = source.sheet
-  const added = new Set(addedHeaders)
-  const cols = new Map(targetHeaders.map((h) => [h, headers.indexOf(h) + 1]))
+  const cols = new Map(
+    targetHeaders.filter((h) => headers.includes(h)).map((h) => [h, headers.indexOf(h) + 1]),
+  )
 
   const headerRow = ws.getRow(1)
   for (const h of addedHeaders) {
@@ -52,9 +53,11 @@ export function annotateWorkbook({ headers, rows, highlights, addedHeaders, targ
       const cell = xlRow.getCell(col)
       cell.value = text || null
       cell.numFmt = '@' // text, so 12-digit call IDs never become 1.16574E+11
+      // Always clear first: these columns are ours, and the workbook object is
+      // reused across downloads, so a stale fill would otherwise linger.
       const kind = highlights.get(`${rowIndex}:${h}`)
       if (kind) paint(cell, kind)
-      else if (added.has(h)) cell.fill = undefined
+      else cell.fill = undefined
     }
     xlRow.commit()
   })

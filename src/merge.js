@@ -45,6 +45,9 @@ export function cellText(v) {
 
 const norm = cellText
 
+/** A 12-digit ID that Excel has rewritten as "1.14178E+11". */
+const MANGLED_ID = /^\d+(\.\d+)?[eE][+-]?\d+$/
+
 /** HubSpot IDs sometimes arrive as "238297728268.0" or with stray spaces. */
 const normId = (v) => norm(v).replace(/\.0+$/, '')
 
@@ -68,12 +71,14 @@ export function parseWhen(value) {
   if (m) {
     ;[, y, mo, d, h = 0, mi = 0, s = 0] = m
   } else {
-    m = t.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})(?:[ ,]+(\d{1,2}):(\d{2})(?::(\d{2}))?\s*([AaPp][Mm])?)?/)
+    m = t.match(/^(\d{1,2})\/(\d{1,2})\/(\d{2,4})(?:[ ,]+(\d{1,2}):(\d{2})(?::(\d{2}))?\s*([AaPp][Mm])?)?/)
     if (!m) return { ms: 0, day: UNKNOWN_DAY }
     ;[, mo, d, y, h = 0, mi = 0, s = 0, ampm] = m
   }
 
   y = +y; mo = +mo; d = +d; h = +h; mi = +mi; s = +s
+  // Excel writes "8/3/26" when the column is formatted m/d/yy -- same window Excel uses.
+  if (y < 100) y += y < 70 ? 2000 : 1900
   if (ampm) {
     const pm = ampm.toLowerCase() === 'pm'
     if (pm && h < 12) h += 12
@@ -167,13 +172,44 @@ export function formatNoteBlocks(blocks) {
 export function mergeNoteHistory(existing, day, dayText) {
   // Undated legacy text gets its own marker, otherwise sitting below a dated
   // header would fold it into that day the next time the cell is parsed.
-  const blocks = parseNoteBlocks(existing).map((b) => ({ ...b, day: b.day ?? UNKNOWN_DAY }))
-  if (!dayText) return formatNoteBlocks(blocks) // an empty day must never wipe history
+  const blocks = parseNoteBlocks(existing)
+    .filter((b) => !b.text.startsWith(TRIM_PREFIX)) // drop a previous run's trim notice
+    .map((b) => ({ ...b, day: b.day ?? UNKNOWN_DAY }))
+  if (!dayText) return fitToCell(blocks) // an empty day must never wipe history
   const out = blocks.filter((b) => b.day !== day)
   out.push({ day, text: dayText })
   // Descending, which also drops "(no date)" to the bottom: '(' sorts below '0'.
   out.sort((a, b) => (a.day < b.day ? 1 : a.day > b.day ? -1 : 0))
-  return formatNoteBlocks(out)
+  return fitToCell(out)
+}
+
+/** Excel refuses to open a file with a cell over 32,767 characters. */
+export const MAX_NOTE_CHARS = 32000
+const TRIM_PREFIX = '[… '
+// No count in the notice: trimming happens a bit at a time across many merges,
+// so any number here would describe one run, not the total actually dropped.
+export const TRIM_NOTICE = `${TRIM_PREFIX}older notes trimmed to fit Excel's 32,767-character cell limit]`
+
+/** True if a notes cell has had history dropped to fit Excel's cell limit. */
+export const wasTrimmed = (text) => cellText(text).includes(TRIM_NOTICE)
+
+/** Drop the oldest days until the cell fits, leaving a note saying so. */
+function fitToCell(blocks) {
+  let out = formatNoteBlocks(blocks)
+  if (out.length <= MAX_NOTE_CHARS) return out
+
+  const kept = [...blocks]
+  while (kept.length > 1) {
+    kept.pop() // blocks are newest-first, so the oldest goes
+    out = formatNoteBlocks([...kept, { day: null, text: TRIM_NOTICE }])
+    if (out.length <= MAX_NOTE_CHARS) return out
+  }
+
+  // A single day's notes are over the limit on their own: cut the text itself.
+  const only = kept[0]
+  const marker = `\n${TRIM_NOTICE}`
+  const room = MAX_NOTE_CHARS - marker.length - (only.day ? only.day.length + 4 : 0)
+  return formatNoteBlocks([{ day: only.day, text: only.text.slice(0, Math.max(0, room)) + marker }])
 }
 
 /**
@@ -191,19 +227,31 @@ export function merge({ baseRows, baseHeaders, callRows, callHeaders, baseKey, c
   }
   const addedHeaders = newHeaders.filter((h) => !baseHeaders.includes(h))
 
+  // The notes column only accumulates if it is actually being carried -- untick
+  // its chip and it must be left out entirely, not written to a column that
+  // isn't in the output.
+  const notesActive = Boolean(notesCol) && carried.includes(notesCol)
+
   // contact id -> row index (last wins if the base has duplicates)
   const index = new Map()
+  const duplicateIds = new Map()
+  let mangledBaseIds = 0
   baseRows.forEach((r, i) => {
     const id = normId(r[baseKey])
-    if (id) index.set(id, i)
+    if (!id) return
+    if (index.has(id)) duplicateIds.set(id, (duplicateIds.get(id) ?? 1) + 1)
+    if (MANGLED_ID.test(id)) mangledBaseIds++
+    index.set(id, i)
   })
 
-  // Bucket calls by contact, keeping only that contact's latest day.
-  const byContact = new Map()
+  // Bucket calls by contact, then by day. A calls export is typically a full
+  // history export, not just "today" -- every day it contains gets folded into
+  // the notes history; only the contact's single latest day feeds the other
+  // (non-history) columns like status/duration.
+  const byContact = new Map() // id -> Map<day, {call, when}[]>
   const unmatched = new Map()
   let noContactId = 0
   let usedCalls = 0
-  let skippedOlderDay = 0
 
   for (const call of callRows) {
     const ids = normId(call[callKey]).split(';').map(normId).filter(Boolean)
@@ -214,64 +262,91 @@ export function merge({ baseRows, baseHeaders, callRows, callHeaders, baseKey, c
         unmatched.set(id, (unmatched.get(id) ?? 0) + 1)
         continue
       }
-      let b = byContact.get(id)
-      if (b && when.day > b.day) { skippedOlderDay += b.calls.length; b = null }
-      if (!b) b = { day: when.day, calls: [] }
-      if (when.day < b.day) { skippedOlderDay++; continue }
-      b.calls.push({ call, when })
-      byContact.set(id, b)
+      let days = byContact.get(id)
+      if (!days) { days = new Map(); byContact.set(id, days) }
+      let dayCalls = days.get(when.day)
+      if (!dayCalls) { dayCalls = []; days.set(when.day, dayCalls) }
+      dayCalls.push({ call, when })
+      usedCalls++
     }
   }
 
+  const unmatchedList = [...unmatched.entries()].map(([id, count]) => ({ id, count }))
   const rows = baseRows.map((r) => ({ ...r }))
   const highlights = new Map() // `${rowIndex}:${header}` -> 'new' | 'updated'
   const preview = []
+  let historyDaysMerged = 0
+  let notesTrimmed = 0
 
-  for (const [id, bucket] of byContact) {
+  for (const [id, days] of byContact) {
     const rowIndex = index.get(id)
     const row = rows[rowIndex]
-    const calls = bucket.calls.sort((a, b) => a.when.ms - b.when.ms) // oldest -> newest
-    usedCalls += calls.length
+    const allDays = [...days.keys()].sort() // ascending
+    const latestDay = allDays[allDays.length - 1]
+    const latestCalls = days.get(latestDay).sort((a, b) => a.when.ms - b.when.ms)
 
     const values = {}
     const kindHint = {}
-    let newNotes = ''
+    const addedThisRun = [] // {day, text} for the preview -- only what actually changed
 
-    if (notesCol) {
-      const seen = new Set()
-      const notes = []
-      for (const { call } of calls) {
-        const n = norm(call[notesCol])
-        if (n && !seen.has(n)) { seen.add(n); notes.push(n) }
-      }
-      newNotes = notes.join('\n\n')
+    if (notesActive) {
       const target = targetColumn(notesCol)
+      let existing = row[target]
+      let anyNew = false
+      let anyUpdated = false
+
+      for (const day of allDays) {
+        const dayCalls = days.get(day).sort((a, b) => a.when.ms - b.when.ms)
+        const seen = new Set()
+        const notes = []
+        for (const { call } of dayCalls) {
+          const n = norm(call[notesCol])
+          if (n && !seen.has(n)) { seen.add(n); notes.push(n) }
+        }
+        const dayText = notes.join('\n\n')
+        if (!dayText) continue
+        const alreadyHadDay = parseNoteBlocks(existing).some((b) => b.day === day)
+        const before = norm(existing)
+        existing = mergeNoteHistory(existing, day, dayText)
+        if (existing === before) continue // already on file verbatim -- not a change
+        if (alreadyHadDay) anyUpdated = true; else anyNew = true
+        addedThisRun.push({ day, text: dayText })
+        historyDaysMerged++
+      }
+
+      values[target] = existing
+      if (wasTrimmed(existing)) notesTrimmed++
       // Appending a day is new data, not a replacement -- only re-merging a day
       // that is already on file overwrites anything.
-      kindHint[target] = parseNoteBlocks(row[target]).some((b) => b.day === bucket.day) ? 'updated' : 'new'
-      values[target] = mergeNoteHistory(row[target], bucket.day, newNotes)
+      if (anyNew) kindHint[target] = 'new'
+      else if (anyUpdated) kindHint[target] = 'updated'
     }
 
     for (const h of carried) {
-      if (h === notesCol) continue
+      if (notesActive && h === notesCol) continue
       // latest non-empty: "latest wins", without blanking a field the last call left empty
       let v = ''
-      for (let i = calls.length - 1; i >= 0; i--) {
-        const c = norm(calls[i].call[h])
+      for (let i = latestCalls.length - 1; i >= 0; i--) {
+        const c = norm(latestCalls[i].call[h])
         if (c) { v = c; break }
       }
       values[targetColumn(h)] = v
     }
 
+    let changed = false
     for (const [header, value] of Object.entries(values)) {
       if (!value) continue
       const before = norm(row[header])
       if (before === value) continue
       highlights.set(`${rowIndex}:${header}`, kindHint[header] ?? (before ? 'updated' : 'new'))
       row[header] = value
+      changed = true
     }
 
-    preview.push({ rowIndex, id, day: bucket.day, callCount: calls.length, values, newNotes })
+    const newNotes = formatNoteBlocks(
+      [...addedThisRun].sort((a, b) => (a.day < b.day ? 1 : a.day > b.day ? -1 : 0)),
+    )
+    preview.push({ rowIndex, id, day: latestDay, callCount: latestCalls.length, daysMerged: allDays.length, values, newNotes, changed })
   }
 
   for (const row of rows) for (const h of newHeaders) if (row[h] == null) row[h] = ''
@@ -282,15 +357,22 @@ export function merge({ baseRows, baseHeaders, callRows, callHeaders, baseKey, c
     targetHeaders: carried.map(targetColumn),
     rows,
     highlights,
-    preview: preview.sort((a, b) => (a.day < b.day ? 1 : -1)),
+    preview: preview.sort((a, b) => (a.day < b.day ? 1 : a.day > b.day ? -1 : 0)),
     stats: {
       baseRows: baseRows.length,
       callRows: callRows.length,
-      contactsUpdated: preview.length,
+      contactsUpdated: preview.filter((p) => p.changed).length,
+      contactsAlreadyCurrent: preview.filter((p) => !p.changed).length,
       usedCalls,
-      skippedOlderDay,
+      historyDaysMerged,
       noContactId,
-      unmatched: [...unmatched.entries()].map(([id, count]) => ({ id, count })),
+      unmatched: unmatchedList,
+      // Excel turns a 12-digit ID into 1.14178E+11 the moment a CSV is opened and
+      // re-saved. That silently matches nothing, so name it rather than report zero.
+      mangledCallIds: unmatchedList.filter((u) => MANGLED_ID.test(u.id)).length,
+      mangledBaseIds,
+      notesTrimmed,
+      duplicateBaseIds: [...duplicateIds.entries()].map(([id, count]) => ({ id, count })),
     },
   }
 }

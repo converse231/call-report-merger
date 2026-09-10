@@ -1,13 +1,14 @@
 import assert from 'node:assert/strict'
 import fs from 'node:fs'
 import ExcelJS from 'exceljs'
+import * as XLSX from 'xlsx'
 import {
   merge, parseWhen, cellText, targetColumn, defaultCarryColumns,
-  mergeNoteHistory, parseNoteBlocks,
-  detectCallKeyColumn, detectDateColumn, detectNotesColumn,
+  mergeNoteHistory, parseNoteBlocks, wasTrimmed,
+  detectBaseKeyColumn, detectCallKeyColumn, detectDateColumn, detectNotesColumn,
 } from './merge.js'
 import { readTable } from './readTable.js'
-import { annotateWorkbook } from './download.js'
+import { annotateWorkbook, buildWorkbook } from './download.js'
 
 /* ---------- cell values ---------- */
 assert.equal(cellText(null), '')
@@ -78,14 +79,16 @@ const opts = { baseRows, baseHeaders, callRows, callHeaders, baseKey: 'Record ID
 const r = merge(opts)
 
 assert.deepEqual(r.addedHeaders, ['Call Activity date', 'Call notes', 'Call Strategic Status Code'])
-assert.equal(r.rows[0]['Call notes'], '[2026-08-24]\nfirst\n\nsecond')  // latest day only, deduped, oldest first
-assert.equal(r.rows[0]['Call Strategic Status Code'], 'Do Not Call')
+// every day present in this export is folded into notes, not just the latest --
+// this is the bug the user reported: 8/3's notes must not be dropped
+assert.equal(r.rows[0]['Call notes'], '[2026-08-24]\nfirst\n\nsecond\n\n[2026-08-03]\nold day')
+assert.equal(r.rows[0]['Call Strategic Status Code'], 'Do Not Call')  // non-notes columns: latest day only
 assert.equal(r.rows[0]['Call Activity date'], '8/24/2026 13:00')
 assert.equal(r.rows[1]['Call Strategic Status Code'], 'Fax')      // semicolon-split ids reach the contact
 assert.equal(r.rows[2]['Call notes'], '')                         // unmatched contact untouched
 assert.deepEqual(r.stats.unmatched, [{ id: '999', count: 1 }])    // unknown id reported, not invented
 assert.equal(r.stats.noContactId, 1)
-assert.equal(r.stats.skippedOlderDay, 1)
+assert.equal(r.stats.historyDaysMerged, 2)                        // Abby's 8/3 + 8/24 (Sam's 8/5 call has no notes)
 assert.equal(r.stats.contactsUpdated, 2)
 assert.equal(r.rows[0]['First Name'], 'Abby')                     // base columns never touched
 assert.equal(r.highlights.get('0:Call notes'), 'new')
@@ -104,8 +107,30 @@ assert.equal(blanked.rows[0]['Call Strategic Status Code'], 'No Answer')
 // re-running on the merged output changes nothing
 const again = merge({ ...opts, baseRows: r.rows, baseHeaders: r.headers })
 assert.deepEqual(again.addedHeaders, [])
-assert.equal(again.rows[0]['Call notes'], '[2026-08-24]\nfirst\n\nsecond')
+assert.equal(again.rows[0]['Call notes'], '[2026-08-24]\nfirst\n\nsecond\n\n[2026-08-03]\nold day')
 assert.equal(again.highlights.size, 0)
+
+// the exact bug report: one contact, five distinct call days in a single export --
+// all five must survive, only the latest feeds the non-notes columns
+const fiveDays = merge({
+  baseHeaders, baseKey: 'Record ID', callHeaders, callKey: 'Associated Contact IDs', dateCol: 'Activity date', notesCol: 'Call notes',
+  baseRows: [{ 'Record ID': '111', 'First Name': 'Abby' }],
+  callRows: [
+    { 'Associated Contact IDs': '111', 'Activity date': '8/3/2026 17:06', 'Call notes': 'Voicemail', 'Strategic Status Code': '' },
+    { 'Associated Contact IDs': '111', 'Activity date': '8/4/2026 16:38', 'Call notes': 'Call back requested', 'Strategic Status Code': '' },
+    { 'Associated Contact IDs': '111', 'Activity date': '8/5/2026 12:37', 'Call notes': 'Left message again', 'Strategic Status Code': '' },
+    { 'Associated Contact IDs': '111', 'Activity date': '8/19/2026 13:01', 'Call notes': 'test test', 'Strategic Status Code': '' },
+    { 'Associated Contact IDs': '111', 'Activity date': '8/24/2026 12:34', 'Call notes': 'just a test', 'Strategic Status Code': 'Scheduled Callback - AC' },
+  ],
+})
+assert.deepEqual(
+  fiveDays.rows[0]['Call notes'].match(/^\[[\d-]+\]/gm),
+  ['[2026-08-24]', '[2026-08-19]', '[2026-08-05]', '[2026-08-04]', '[2026-08-03]'],
+  'all five call days must appear, newest first',
+)
+assert.match(fiveDays.rows[0]['Call notes'], /Voicemail/)         // 8/3 -- the note the bug report said vanished
+assert.equal(fiveDays.rows[0]['Call Strategic Status Code'], 'Scheduled Callback - AC')  // still latest-day only
+assert.equal(fiveDays.stats.historyDaysMerged, 5)
 
 
 /* ---------- notes accumulate across runs, newest day on top ---------- */
@@ -150,65 +175,194 @@ assert.equal(runB.rows[1]['Call notes'], '[2026-09-08]\nMON: sam')  // no new ca
 assert.equal(runB.highlights.get('0:Call notes'), 'new')  // appended, so green not amber
 assert.equal(runB.highlights.get('1:Call notes'), undefined)
 
-/* ---------- XLSX round trip against the real exports ---------- */
-const BASE = 'docs/hubspot-CONTACTS.xlsx'
-const CALLS = 'docs/hubspot-CALLLS.xlsx'
-if (fs.existsSync(BASE) && fs.existsSync(CALLS)) {
-  const asFile = (p) => ({ name: p.split('/').pop(), arrayBuffer: async () => fs.readFileSync(p) })
-  const base = await readTable(asFile(BASE))
-  const calls = await readTable(asFile(CALLS))
-  const callKey = detectCallKeyColumn(calls.headers)
-  const carry = defaultCarryColumns(calls.headers, callKey)
-  assert.equal(carry.length, 8, 'exactly 8 of the 94 call columns are carried')
+/* ---------- legacy .xls input (BIFF8/OLE2, not zip-based) ---------- */
+{
+  const wb = XLSX.utils.book_new()
+  XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet([]), 'Sheet1') // HubSpot-style empty leading sheet
+  const sheet = XLSX.utils.aoa_to_sheet([
+    ['Record ID', 'First Name'],
+    [111, 'Abby'],
+    [222, 'Sam'],
+  ])
+  XLSX.utils.book_append_sheet(wb, sheet, 'Contacts')
+  const xlsBuf = XLSX.write(wb, { type: 'buffer', bookType: 'biff8' })
+  assert.deepEqual([...xlsBuf.subarray(0, 4)], [0xd0, 0xcf, 0x11, 0xe0], 'fixture really is BIFF8, not zip')
 
-  const real = merge({
-    baseRows: base.rows, baseHeaders: base.headers,
-    callRows: calls.rows, callHeaders: calls.headers,
-    carryColumns: carry, callKey, baseKey: 'Record ID',
-    dateCol: detectDateColumn(calls.headers), notesCol: detectNotesColumn(calls.headers),
+  const asFile = (name, buf) => ({ name, arrayBuffer: async () => buf })
+  const legacyBase = await readTable(asFile('legacy.xls', xlsBuf))
+  assert.deepEqual(legacyBase.headers, ['Record ID', 'First Name'])
+  assert.equal(legacyBase.rows.length, 2)
+  assert.equal(legacyBase.workbook, undefined, 'no live workbook to preserve -- output rebuilds fresh')
+
+  const legacyMerge = merge({
+    baseRows: legacyBase.rows, baseHeaders: legacyBase.headers,
+    callRows: [{ 'Associated Contact IDs': '111', 'Activity date': '9/8/2026 09:00', 'Call notes': 'hi' }],
+    callHeaders: ['Associated Contact IDs', 'Activity date', 'Call notes'],
+    baseKey: 'Record ID', callKey: 'Associated Contact IDs', dateCol: 'Activity date', notesCol: 'Call notes',
   })
-  assert.equal(real.addedHeaders.length, 8)
-  assert.equal(real.headers.length, base.headers.length + 8)
-  assert.ok(real.stats.contactsUpdated > 0, 'the real files must actually match on something')
+  assert.equal(legacyMerge.rows[0]['Call notes'], '[2026-09-08]\nhi')
+  const outWb = buildWorkbook(legacyMerge)
+  assert.ok((await outWb.xlsx.writeBuffer()).byteLength > 0, 'a fresh xlsx must still be produced from a legacy base')
 
-  const out = 'src/.merge-roundtrip.tmp.xlsx'
-  await annotateWorkbook({ ...real, source: base }).xlsx.writeFile(out)
+  // a file's real signature wins over a misleading extension in either direction
+  const xlsxBuf = await (async () => {
+    const w = new ExcelJS.Workbook()
+    const s = w.addWorksheet('S')
+    s.addRow(['a']).commit()
+    s.addRow(['b']).commit()
+    return w.xlsx.writeBuffer()
+  })()
+  assert.ok(new Uint8Array(xlsxBuf).subarray(0, 2).join() === [0x50, 0x4b].join(), 'fixture really is zip-based')
+  const mislabeled = await readTable(asFile('really-xlsx.xls', xlsxBuf))
+  assert.ok(mislabeled.workbook, 'zip content routes through ExcelJS even with a .xls name')
 
-  const orig = new ExcelJS.Workbook(); await orig.xlsx.readFile(BASE)
-  const back = new ExcelJS.Workbook(); await back.xlsx.readFile(out)
-  const ows = orig.worksheets.find((w) => w.actualRowCount > 1)
-  const nws = back.worksheets.find((w) => w.actualRowCount > 1)
+  await assert.rejects(
+    readTable(asFile('not-a-spreadsheet.xls', new TextEncoder().encode('hello,world'))),
+    /doesn't look like an Excel file/,
+  )
+  console.log('legacy .xls input: parses, merges, and signature-sniffing works')
+}
 
-  // every original cell keeps its value, its number format and its lack of colour
-  for (let rn = 1; rn <= ows.rowCount; rn++) {
-    for (let c = 1; c <= base.headers.length; c++) {
-      const a = ows.getRow(rn).getCell(c), b = nws.getRow(rn).getCell(c)
-      assert.deepEqual(b.value, a.value, `base value changed at r${rn}c${c}`)
-      assert.equal(b.numFmt, a.numFmt, `base number format changed at r${rn}c${c}`)
-      assert.equal(b.fill?.fgColor?.argb, undefined, `base cell coloured at r${rn}c${c}`)
-    }
+
+/* ---------- QA regressions ---------- */
+
+// unticking the notes chip must leave notes out entirely, not write to a
+// column that isn't in the output
+const noNotes = merge({ ...opts, carryColumns: ['Strategic Status Code'] })
+assert.deepEqual(noNotes.addedHeaders, ['Call Strategic Status Code'])
+assert.equal(noNotes.rows[0]['Call notes'], undefined)
+assert.equal(noNotes.preview[0].newNotes, '')
+
+// pointing the notes dropdown at the join key must not invent a stray column
+const notesIsKey = merge({ ...opts, notesCol: 'Associated Contact IDs' })
+assert.deepEqual(
+  Object.keys(notesIsKey.rows[0]).filter((k) => !notesIsKey.headers.includes(k)), [],
+  'no value may be written to a column missing from headers',
+)
+
+// chaining a second calls file onto the first merge keeps the first file's history
+const chainA = merge({
+  ...opts, baseRows: [{ 'Record ID': '111', 'First Name': 'Abby' }],
+  callRows: [{ 'Associated Contact IDs': '111', 'Activity date': '9/8/2026 09:00', 'Call notes': 'MON' }],
+})
+const chainB = merge({
+  ...opts, baseRows: chainA.rows, baseHeaders: chainA.headers,
+  callRows: [{ 'Associated Contact IDs': '111', 'Activity date': '9/9/2026 09:00', 'Call notes': 'TUE' }],
+})
+assert.equal(chainB.rows[0]['Call notes'], '[2026-09-09]\nTUE\n\n[2026-09-08]\nMON')
+
+// stats must not claim updates when nothing changed
+assert.equal(again.stats.contactsUpdated, 0)
+assert.equal(again.stats.historyDaysMerged, 0)
+assert.equal(again.stats.contactsAlreadyCurrent, 2)
+assert.ok(again.preview.every((p) => !p.changed))
+assert.equal(r.preview.filter((p) => p.changed).length, r.stats.contactsUpdated)
+
+// Excel writes 2-digit years when a column is formatted m/d/yy
+assert.equal(parseWhen('8/3/26 17:06').day, '2026-08-03')
+assert.equal(parseWhen('8/3/99').day, '1999-08-03')
+
+// duplicate contact IDs in the base are reported rather than silently half-applied
+const dup = merge({
+  ...opts, baseRows: [{ 'Record ID': '111', 'First Name': 'A' }, { 'Record ID': '111', 'First Name': 'B' }],
+  callRows: [{ 'Associated Contact IDs': '111', 'Activity date': '9/8/2026', 'Call notes': 'x' }],
+})
+assert.deepEqual(dup.stats.duplicateBaseIds, [{ id: '111', count: 2 }])
+
+// Excel-mangled IDs get named, not just reported as zero matches
+const mangled = merge({
+  ...opts, baseRows: [{ 'Record ID': '1.14178E+11', 'First Name': 'A' }],
+  callRows: [{ 'Associated Contact IDs': '1.14203E+11', 'Activity date': '9/8/2026', 'Call notes': 'x' }],
+})
+assert.equal(mangled.stats.mangledCallIds, 1)
+assert.equal(mangled.stats.mangledBaseIds, 1)
+assert.equal(mangled.stats.contactsUpdated, 0)
+assert.equal(r.stats.mangledCallIds, 0, 'a normal 12-digit id is not mistaken for a mangled one')
+
+// Excel rejects a workbook with a cell over 32,767 characters
+{
+  let cell = ''
+  const d = new Date(Date.UTC(2025, 0, 1))
+  for (let i = 0; i < 400; i++) {
+    cell = mergeNoteHistory(cell, d.toISOString().slice(0, 10), ('Outbound answered call, Call ID: 402' + i + ' ').repeat(4))
+    d.setUTCDate(d.getUTCDate() + 1)
   }
-
-  const hdr = []
-  for (let c = 1; c <= nws.columnCount; c++) hdr.push(cellText(nws.getRow(1).getCell(c).value))
-  assert.deepEqual(hdr.slice(base.headers.length), real.addedHeaders)
-  const idCol = hdr.indexOf('Call Record ID') + 1
-  const anyId = real.preview.map((p) => nws.getRow(base.sheetRowNumbers[p.rowIndex]).getCell(idCol).value)
-  assert.ok(anyId.every((v) => /^\d{12}$/.test(String(v))), 'call Record IDs keep all 12 digits')
-
-  const merged = await readTable(asFile(out))
-  const rerun = merge({
-    baseRows: merged.rows, baseHeaders: merged.headers,
-    callRows: calls.rows, callHeaders: calls.headers,
-    carryColumns: carry, callKey, baseKey: 'Record ID',
-    dateCol: detectDateColumn(calls.headers), notesCol: detectNotesColumn(calls.headers),
+  assert.ok(cell.length <= 32767, 'notes cell must fit Excel limit, got ' + cell.length)
+  assert.ok(wasTrimmed(cell))
+  assert.ok(cell.startsWith('[2026-'), 'the newest days survive trimming')
+  // the notice must not stack up run after run
+  const more = mergeNoteHistory(cell, '2026-02-05', 'another call')
+  assert.equal((more.match(/older notes trimmed/g) ?? []).length, 1)
+  assert.ok(more.length <= 32767)
+  // a single day too big on its own gets its text cut instead of vanishing
+  const oneHuge = mergeNoteHistory('', '2026-01-01', 'y'.repeat(40000))
+  assert.ok(oneHuge.length <= 32767 && wasTrimmed(oneHuge))
+  // and merge() surfaces it so the UI can warn
+  const trimmedMerge = merge({
+    ...opts, baseRows: [{ 'Record ID': '111', 'First Name': 'A', 'Call notes': cell }],
+    baseHeaders: ['Record ID', 'First Name', 'Call notes'],
+    callRows: [{ 'Associated Contact IDs': '111', 'Activity date': '3/1/2026', 'Call notes': 'z' }],
   })
-  assert.equal(rerun.addedHeaders.length, 0, 'a second merge must not duplicate columns')
-  assert.equal(rerun.highlights.size, 0, 'a second merge must not change anything')
+  assert.equal(trimmedMerge.stats.notesTrimmed, 1)
+}
+
+// preview ordering is stable for contacts sharing a day
+{
+  const sameDay = merge({
+    ...opts,
+    baseRows: [{ 'Record ID': '1' }, { 'Record ID': '2' }, { 'Record ID': '3' }],
+    baseHeaders: ['Record ID'],
+    callRows: ['1', '2', '3'].map((id) => ({ 'Associated Contact IDs': id, 'Activity date': '9/8/2026', 'Call notes': 'n' })),
+  })
+  assert.deepEqual(sameDay.preview.map((p) => p.id), ['1', '2', '3'])
+}
+
+/* ---------- XLSX round trip (synthetic, so it runs anywhere) ---------- */
+{
+  const wb = new ExcelJS.Workbook()
+  const ws = wb.addWorksheet('Contacts')
+  ws.addRow(['Record ID', 'First Name', 'Last Activity Date']).commit()
+  const dated = ws.addRow([246317725467, 'Randy', new Date(Date.UTC(2026, 8, 4, 16, 32))])
+  dated.getCell(3).numFmt = 'm/d/yy "h":mm'
+  dated.commit()
+  ws.addRow([238297728268, 'Abby', null]).commit()
+  const baseBuf = await wb.xlsx.writeBuffer()
+
+  const rtBase = await readTable({ name: 'base.xlsx', arrayBuffer: async () => baseBuf })
+  assert.ok(rtBase.workbook, '.xlsx keeps a live workbook so base cells can be preserved')
+
+  const rt = merge({
+    baseRows: rtBase.rows, baseHeaders: rtBase.headers,
+    callHeaders: ['Associated Contact IDs', 'Activity date', 'Call notes'],
+    callRows: [{ 'Associated Contact IDs': '238297728268', 'Activity date': '9/8/2026 15:01', 'Call notes': 'hello' }],
+    baseKey: 'Record ID', callKey: 'Associated Contact IDs', dateCol: 'Activity date', notesCol: 'Call notes',
+  })
+  const out = 'src/.roundtrip.tmp.xlsx'
+  await annotateWorkbook({ ...rt, source: rtBase }).xlsx.writeFile(out)
+
+  const orig = new ExcelJS.Workbook(); await orig.xlsx.readFile(out)
+  const ows = orig.worksheets[0]
+  // untouched base cells keep their value, number format and lack of fill
+  assert.equal(ows.getRow(2).getCell(1).value, 246317725467)
+  assert.equal(ows.getRow(2).getCell(3).numFmt, 'm/d/yy "h":mm')
+  assert.deepEqual(ows.getRow(2).getCell(3).value, new Date(Date.UTC(2026, 8, 4, 16, 32)))
+  assert.equal(ows.getRow(2).getCell(1).fill?.fgColor?.argb, undefined)
+  // the merged row is written as text and highlighted
+  const notesCol = rt.headers.indexOf('Call notes') + 1
+  assert.equal(ows.getRow(3).getCell(notesCol).value, '[2026-09-08]\nhello')
+  assert.equal(ows.getRow(3).getCell(notesCol).fill?.fgColor?.argb, 'FFD8F0D8')
+  assert.equal(ows.getRow(2).getCell(notesCol).value, null, 'a contact with no calls stays empty')
+
+  // a stale fill from an earlier download must not survive a later one
+  await annotateWorkbook({ ...rt, highlights: new Map(), source: rtBase }).xlsx.writeFile(out)
+  const repaint = new ExcelJS.Workbook(); await repaint.xlsx.readFile(out)
+  assert.equal(
+    repaint.worksheets[0].getRow(3).getCell(notesCol).fill?.fgColor?.argb, undefined,
+    'download must repaint from scratch, not accumulate stale colours',
+  )
+
   fs.unlinkSync(out)
-  console.log(`xlsx round trip: ${base.rows.length} base rows preserved, ${real.stats.contactsUpdated} contacts updated`)
-} else {
-  console.log('xlsx round trip: skipped (sample exports not in docs/)')
+  console.log('xlsx round trip: base cells preserved, highlights repaint cleanly')
 }
 
 console.log('all checks passed')

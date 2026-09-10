@@ -1,7 +1,8 @@
 # Call Report Merger
 
 Merges a HubSpot **calls** export into a HubSpot **contacts** export.
-Takes `.xlsx` or `.csv` on either side.
+Takes `.xlsx`, legacy `.xls`, or `.csv` on either side — routed by the file's
+own signature, not its extension, so a misnamed file still loads correctly.
 
 ```bash
 npm install
@@ -40,19 +41,26 @@ Refusal / Scheduled Callback - AC).
 
 For each contact:
 
-1. Find their **most recent call day**. Earlier days are ignored.
-2. Join every note from that day, oldest first, exact duplicates dropped, then
-   **add that day on top of the notes already in the base** under a `[YYYY-MM-DD]`
-   heading. Earlier days stay. Re-merging a day replaces only that day's block, so
-   running the same export twice is a no-op.
-3. Every other call column takes the **latest non-blank** value from that day.
-   Only notes accumulate — the rest hold the latest value, not a history.
+1. Group their calls in this export **by day** — a calls export is normally a full
+   history, not just today, so every day it contains is used, not only the latest.
+2. For each day: join that day's notes, oldest call first, exact duplicates dropped,
+   then **add that day on top of the notes already in the base** under a
+   `[YYYY-MM-DD]` heading, newest day first. Earlier days already on file stay.
+   Re-merging a day replaces only that day's block, so running the same export
+   twice is a no-op.
+3. Every other call column (status, duration, etc.) takes the **latest non-blank**
+   value from the contact's single most recent day. Only notes accumulate — the
+   rest hold the latest value, not a history.
 4. Results are appended as new `Call …` columns.
 
 When the base is `.xlsx`, the new columns are written **into the original workbook**:
 existing cells keep their own values, date formats and column widths, because they
-are never read back and rewritten. `npm test` asserts this cell by cell over all
-3,083 rows of the sample export.
+are never read back and rewritten. `npm test` asserts this cell by cell.
+
+A base file that's legacy `.xls` (or CSV) has no such workbook to write back into,
+so the output is a freshly built `.xlsx` instead — values come through correctly,
+the original file's own formatting just isn't preserved cell-for-cell since it's
+parsed into plain values, not re-opened.
 
 Re-running on an already-merged file writes into the same `Call …` columns rather
 than adding duplicates. A contact with no calls in the new export is left alone.
