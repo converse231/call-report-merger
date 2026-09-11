@@ -1,24 +1,25 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react'
 import {
-  merge, targetColumn, defaultCarryColumns, DEFAULT_CALL_COLUMNS,
+  merge, targetColumn, defaultCarryColumns, DEFAULT_CALL_COLUMNS, parseNoteBlocks,
   detectBaseKeyColumn, detectCallKeyColumn, detectDateColumn, detectNotesColumn,
+  detectSplitDateColumn, detectProjectColumn, groupByProject, sliceResult, splitTargets, NO_PROJECT,
 } from './merge.js'
 import { readTable } from './readTable.js'
 import { downloadCsv, downloadXlsx } from './download.js'
 
-function Drop({ label, hint, file, onFile, error, busy }) {
+const n = (x) => x.toLocaleString()
+const scopeTag = (s) => (s ? `-${s.replace(/[^\w.-]+/g, '_').replace(/^_|_$/g, '')}` : '')
+
+/* ------------------------------------------------------------------ files */
+
+function DropZone({ step, title, hint, children, onFile, error, busy, filled }) {
   const input = useRef(null)
-  const [over, setOver] = useState(false)
   const open = () => input.current.click()
+  const [over, setOver] = useState(false)
 
   return (
     <div
-      className={`drop ${file ? 'ok' : ''} ${over ? 'over' : ''} ${error ? 'bad' : ''}`}
-      role="button"
-      tabIndex={0}
-      aria-label={label}
-      onClick={open}
-      onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); open() } }}
+      className={`zone ${filled ? 'filled' : ''} ${over ? 'over' : ''} ${error ? 'bad' : ''}`}
       onDragOver={(e) => { e.preventDefault(); setOver(true) }}
       onDragLeave={() => setOver(false)}
       onDrop={(e) => { e.preventDefault(); setOver(false); if (e.dataTransfer.files[0]) onFile(e.dataTransfer.files[0]) }}
@@ -28,32 +29,40 @@ function Drop({ label, hint, file, onFile, error, busy }) {
         // reset the value so picking the same file again still fires a change
         onChange={(e) => { const f = e.target.files[0]; e.target.value = ''; if (f) onFile(f) }}
       />
-      <div className="drop-label">{label}</div>
-      {busy ? (
-        <div className="drop-meta">Reading…</div>
-      ) : file ? (
-        <>
-          <div className="drop-file">{file.name}</div>
-          <div className="drop-meta">{file.rows.length.toLocaleString()} rows &middot; {file.headers.length} columns</div>
-          <div className="drop-swap">Click to replace</div>
-        </>
-      ) : (
-        <>
-          <div className="drop-hint">{hint}</div>
-          <div className="drop-swap">Drop a .xlsx, .xls, or .csv here, or click to browse</div>
-        </>
-      )}
-      {error && <div className="drop-error">{error}</div>}
+      <div className="zone-head">
+        <span className={`zone-step ${filled ? 'done' : ''}`}>{filled ? '✓' : step}</span>
+        <span className="zone-title">{title}</span>
+      </div>
+
+      {busy ? <div className="zone-hint">Reading the file…</div> : children}
+
+      {!filled && !busy && <div className="zone-hint">{hint}</div>}
+      <button className="zone-btn" onClick={open} disabled={busy}>
+        {filled ? 'Choose a different file' : 'Choose file'}
+        <span className="zone-drop">or drop it here</span>
+      </button>
+      {error && <div className="zone-error">{error}</div>}
     </div>
   )
 }
 
-function Select({ label, value, options, onChange, note }) {
+/* ------------------------------------------------------- settings summary */
+
+function Chip({ on, onToggle, children }) {
+  return (
+    <label className={`chip ${on ? 'on' : ''}`}>
+      <input type="checkbox" checked={on} onChange={onToggle} />
+      {children}
+    </label>
+  )
+}
+
+function Field({ label, value, options, onChange, note, noneLabel = '— none —' }) {
   return (
     <label className="field">
       <span className="field-label">{label}</span>
       <select value={value} onChange={(e) => onChange(e.target.value)}>
-        <option value="">&mdash; none &mdash;</option>
+        <option value="">{noneLabel}</option>
         {options.map((o) => <option key={o} value={o}>{o}</option>)}
       </select>
       {note && <span className="field-note">{note}</span>}
@@ -61,31 +70,206 @@ function Select({ label, value, options, onChange, note }) {
   )
 }
 
-function Stat({ n, label, tone = '', muted }) {
+/* ------------------------------------------------------------- note cell */
+
+function Notes({ text }) {
+  const blocks = parseNoteBlocks(text)
+  if (!blocks.length) return <em className="dim">no notes</em>
   return (
-    <div className={`stat ${tone} ${muted ? 'muted' : ''}`}>
-      <div className="stat-n">{n.toLocaleString()}</div>
-      <div className="stat-l">{label}</div>
+    <div className="entries">
+      {blocks.map((b, i) => (
+        <div className="entry" key={i}>
+          {b.day && <span className="entry-day">{b.day}</span>}
+          <span className="entry-text">{b.text}</span>
+        </div>
+      ))}
     </div>
+  )
+}
+
+/* ------------------------------------------------------------------- app */
+
+/** The whole result half of the page. Exported so `npm test` can render it with real data. */
+export function ResultView({ result, map, carry, projects, scope, onScope, saving, onSave, stem, nameCols, missingStandard, saveError, onStartOver }) {
+  const st = result.stats
+  const changed = result.preview.filter((p) => p.changed)
+  const tag = scopeTag(scope)
+  const scopeRows = scope ? projects.get(scope)?.length ?? 0 : result.rows.length
+  return (
+    <>
+          <section className="out">
+            <div className={`verdict ${st.contactsUpdated ? 'good' : 'warn'}`}>
+              <span className="verdict-icon">{st.contactsUpdated ? '✓' : '!'}</span>
+              <div>
+                <div className="verdict-main">
+                  {st.contactsUpdated
+                    ? <>{n(st.contactsUpdated)} {st.contactsUpdated === 1 ? 'contact' : 'contacts'} updated</>
+                    : <>Nothing changed</>}
+                </div>
+                <div className="verdict-sub">
+                  {st.contactsUpdated
+                    ? <>{n(st.historyDaysMerged)} call-{st.historyDaysMerged === 1 ? 'day' : 'days'} of notes added across {n(st.usedCalls)} calls</>
+                    : st.contactsAlreadyCurrent > 0
+                      ? <>All {n(st.contactsAlreadyCurrent)} matching contacts already have this call data.</>
+                      : <>No call matched a contact. Check the contact ID columns under “Change” above.</>}
+                </div>
+              </div>
+            </div>
+
+            <div className="export">
+              {projects.size > 1 ? (
+                <div className="export-scope">
+                  <span className="field-label">Export</span>
+                  <div className="pills">
+                    <button className={`pill ${!scope ? 'on' : ''}`} onClick={() => onScope('')}>
+                      All contacts <b>{n(result.rows.length)}</b>
+                    </button>
+                    {[...projects].map(([name, idx]) => (
+                      <button key={name} className={`pill ${scope === name ? 'on' : ''}`} onClick={() => onScope(name)}>
+                        {name} <b>{n(idx.length)}</b>
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              ) : (
+                <p className="export-note">
+                  {!map.projectCol
+                    ? <>Want one file per project? Pick your project column under <strong>Change</strong> above.</>
+                    : <>No contact has a value in <strong>{map.projectCol}</strong> yet, so there are no projects to
+                       split by. Fill it in on HubSpot and the options appear here.</>}
+                </p>
+              )}
+
+              <div className="export-go">
+                <button className="primary" disabled={!!saving} onClick={() => onSave('xlsx')}>
+                  {saving === 'xlsx' ? 'Building…' : 'Download Excel'}
+                </button>
+                <button disabled={!!saving} onClick={() => onSave('csv')}>
+                  {saving === 'csv' ? 'Building…' : 'CSV'}
+                </button>
+                <span className="export-file">
+                  <code>{stem}-merged{tag}.xlsx</code> · {n(scopeRows)} rows
+                  {scope && <> · built fresh, so the original file’s formatting isn’t carried over</>}
+                </span>
+              </div>
+              {saveError && <div className="alert">{saveError}</div>}
+            </div>
+          </section>
+
+          {(missingStandard.length > 0 || st.mangledCallIds > 0 || st.mangledBaseIds > 0 || st.notesTrimmed > 0
+            || (map.notesCol && !carry.includes(map.notesCol))) && (
+            <div className="notes-stack">
+              {map.notesCol && !carry.includes(map.notesCol) && (
+                <div className="note warn"><strong>{targetColumn(map.notesCol)}</strong> is unticked, so no call notes are being written.</div>
+              )}
+              {missingStandard.length > 0 && (
+                <div className="note warn">
+                  <strong>{missingStandard.join(', ')}</strong> {missingStandard.length === 1 ? 'is' : 'are'} missing
+                  from the calls export, so {missingStandard.length === 1 ? 'it' : 'they'} can’t be filled in.
+                  Re-export from HubSpot with {missingStandard.length === 1 ? 'it' : 'them'} included.
+                </div>
+              )}
+              {(st.mangledCallIds > 0 || st.mangledBaseIds > 0) && (
+                <div className="note warn">
+                  <strong>Excel has damaged some Record IDs.</strong>{' '}
+                  {st.mangledCallIds > 0 && `${st.mangledCallIds} in the calls file `}
+                  {st.mangledCallIds > 0 && st.mangledBaseIds > 0 && 'and '}
+                  {st.mangledBaseIds > 0 && `${st.mangledBaseIds} in the contacts file `}
+                  read as <code>1.14178E+11</code> instead of a 12-digit number, so those rows can never match.
+                  That happens when a CSV is opened and re-saved in Excel — re-export as .xlsx.
+                </div>
+              )}
+              {st.notesTrimmed > 0 && (
+                <div className="note warn">
+                  <strong>{st.notesTrimmed} contact{st.notesTrimmed === 1 ? '' : 's'}</strong> hit Excel’s
+                  32,767-character cell limit, so the oldest notes were dropped to keep the file openable.
+                  The full history is still in HubSpot.
+                </div>
+              )}
+            </div>
+          )}
+
+          {changed.length > 0 && (
+            <section>
+              <div className="out-head">
+                <h2>What changed</h2>
+                <span className="legend">
+                  <i className="sw new" /> added
+                  <i className="sw updated" /> replaced
+                  <i className="sw header" /> new column
+                  <em>colours show in the Excel file</em>
+                </span>
+              </div>
+              <div className="tablewrap">
+                <table>
+                  <thead>
+                    <tr>
+                      <th>Contact</th>
+                      <th className="num">Days</th>
+                      <th>Notes added</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {changed.slice(0, 100).map((p) => (
+                      <tr key={p.id}>
+                        <td>
+                          <div className="who">{nameCols.map((h) => result.rows[p.rowIndex][h]).join(' ').trim() || '—'}</div>
+                          <div className="mono dim">{p.id}</div>
+                        </td>
+                        <td className="num">{p.daysMerged}</td>
+                        <td><Notes text={p.newNotes} /></td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+              {changed.length > 100 && <p className="sub">Showing 100 of {n(changed.length)}.</p>}
+            </section>
+          )}
+
+          <div className="tally">
+            <span>{n(st.baseRows)} contacts in file</span>
+            <span>{n(st.usedCalls)} calls read</span>
+            {st.contactsAlreadyCurrent > 0 && <span>{n(st.contactsAlreadyCurrent)} already up to date</span>}
+            {st.noContactId > 0 && <span>{n(st.noContactId)} calls with no contact</span>}
+            {st.unmatched.length > 0 && (
+              <details>
+                <summary>{n(st.unmatched.length)} IDs not in contacts</summary>
+                <div className="idlist">{st.unmatched.map((u) => `${u.id} (${u.count})`).join('   ')}</div>
+              </details>
+            )}
+            {st.duplicateBaseIds.length > 0 && (
+              <details>
+                <summary>{n(st.duplicateBaseIds.length)} duplicate contact IDs</summary>
+                <div className="idlist">
+                  Only the last row of each was updated.{' '}
+                  {st.duplicateBaseIds.map((u) => `${u.id} (${u.count}×)`).join('   ')}
+                </div>
+              </details>
+            )}
+            {onStartOver && (
+              <button className="link" onClick={onStartOver}>
+                Start over
+              </button>
+            )}
+          </div>
+    </>
   )
 }
 
 export default function App() {
   const [base, setBase] = useState(null)
   const [baseFile, setBaseFile] = useState(null)
-  const [calls, setCalls] = useState(null)
+  const [callFiles, setCallFiles] = useState([])
   const [errors, setErrors] = useState({})
   const [loading, setLoading] = useState({})
-  const [map, setMap] = useState({ baseKey: '', callKey: '', dateCol: '', notesCol: '' })
+  const [map, setMap] = useState({ baseKey: '', callKey: '', dateCol: '', notesCol: '', splitCol: '', projectCol: '' })
   const [carry, setCarry] = useState([])
-  // Everything merged so far this session, so a second calls file builds on the
-  // first instead of starting over from the file as uploaded.
-  const [work, setWork] = useState(null)
-  const [result, setResult] = useState(null)
-  const [busy, setBusy] = useState(false)
+  const [scope, setScope] = useState('')
+  const [tuning, setTuning] = useState(false)
   const [saving, setSaving] = useState('')
 
-  // A file dropped outside a drop zone would otherwise navigate away and lose everything.
+  // A file dropped outside a zone would otherwise navigate away and lose everything.
   useEffect(() => {
     const stop = (e) => e.preventDefault()
     window.addEventListener('dragover', stop)
@@ -94,329 +278,252 @@ export default function App() {
   }, [])
 
   async function load(kind, file) {
-    setResult(null)
     setLoading((l) => ({ ...l, [kind]: true }))
     try {
-      const parsed = await readTable(file)
-      setErrors((e) => ({ ...e, [kind]: null, merge: null }))
+      const t = await readTable(file)
+      setErrors((e) => ({ ...e, [kind]: null }))
       if (kind === 'base') {
-        setBase(parsed)
+        setBase(t)
         setBaseFile(file)
-        setWork(null) // a fresh base resets the session's accumulated merges
-        setMap((m) => ({ ...m, baseKey: detectBaseKeyColumn(parsed.headers) }))
+        setScope('')
+        setMap((m) => ({
+          ...m,
+          baseKey: detectBaseKeyColumn(t.headers),
+          splitCol: detectSplitDateColumn(t.headers),
+          projectCol: detectProjectColumn(t.headers),
+        }))
       } else {
-        const callKey = detectCallKeyColumn(parsed.headers)
-        setCalls(parsed)
+        const callKey = detectCallKeyColumn(t.headers)
+        setCallFiles((fs) => (fs.some((f) => f.name === t.name) ? fs : [...fs, t]))
         setMap((m) => ({
           ...m,
           callKey,
-          dateCol: detectDateColumn(parsed.headers),
-          notesCol: detectNotesColumn(parsed.headers),
+          dateCol: detectDateColumn(t.headers),
+          notesCol: detectNotesColumn(t.headers),
         }))
-        setCarry(defaultCarryColumns(parsed.headers, callKey))
+        setCarry((c) => [...new Set([...c, ...defaultCarryColumns(t.headers, callKey)])])
       }
     } catch (err) {
       setErrors((e) => ({ ...e, [kind]: err.message }))
-      if (kind === 'base') { setBase(null); setBaseFile(null); setWork(null) } else setCalls(null)
+      if (kind === 'base') { setBase(null); setBaseFile(null) }
     } finally {
       setLoading((l) => ({ ...l, [kind]: false }))
     }
   }
 
-  const blockers = []
-  if (!base) blockers.push('a base contacts file')
-  if (!calls) blockers.push('a calls export')
-  if (base && calls && !map.baseKey) blockers.push('the base contact ID column')
-  if (base && calls && !map.callKey) blockers.push('the calls contact ID column')
-  if (base && calls && !map.dateCol) blockers.push('the calls date column')
-  if (base && calls && !carry.length) blockers.push('at least one call column to add')
-  const ready = blockers.length === 0
+  /**
+   * The merge is pure and takes milliseconds, so there is no Merge button --
+   * the result recomputes from the untouched contacts file whenever anything
+   * changes. Recomputing from scratch is also what keeps several calls files
+   * from being applied twice.
+   * ponytail: synchronous; if a file ever gets big enough to jank, move to a worker.
+   */
+  const result = useMemo(() => {
+    if (!base || !callFiles.length || !map.baseKey) return null
+    const has = (t, col, fallback) => (t.headers.includes(col) ? col : fallback(t.headers))
 
-  function run() {
-    setBusy(true)
-    // yield once so the button repaints before the synchronous merge
-    setTimeout(() => {
-      try {
-        const src = work ?? { rows: base.rows, headers: base.headers }
-        const r = merge({
-          baseRows: src.rows, baseHeaders: src.headers,
-          callRows: calls.rows, callHeaders: calls.headers,
-          carryColumns: carry, ...map,
-        })
-        // Colours and columns are cumulative across the session so a download
-        // always reflects everything changed since the base was loaded.
-        const highlights = new Map(work?.highlights ?? [])
-        for (const [k, v] of r.highlights) highlights.set(k, v)
-        const union = (a = [], b = []) => [...new Set([...a, ...b])]
-        const addedHeaders = union(work?.addedHeaders, r.addedHeaders)
-        const targetHeaders = union(work?.targetHeaders, r.targetHeaders)
+    let rows = base.rows
+    let headers = base.headers
+    const highlights = new Map()
+    let addedHeaders = []
+    let targetHeaders = []
+    let last = null
 
-        setWork({ rows: r.rows, headers: r.headers, highlights, addedHeaders, targetHeaders })
-        setResult({ ...r, highlights, addedHeaders, targetHeaders, source: base.workbook ? base : null })
-        setErrors((e) => ({ ...e, merge: null }))
-      } catch (err) {
-        setErrors((e) => ({ ...e, merge: err.message }))
-      } finally {
-        setBusy(false)
-      }
-    }, 0)
-  }
+    for (const t of callFiles) {
+      const callKey = has(t, map.callKey, detectCallKeyColumn)
+      const picked = carry.filter((h) => t.headers.includes(h))
+      const r = merge({
+        baseRows: rows, baseHeaders: headers,
+        callRows: t.rows, callHeaders: t.headers,
+        baseKey: map.baseKey,
+        callKey,
+        dateCol: has(t, map.dateCol, detectDateColumn),
+        notesCol: has(t, map.notesCol, detectNotesColumn),
+        carryColumns: picked.length ? picked : defaultCarryColumns(t.headers, callKey),
+        splitDateColumns: [map.splitCol],
+      })
+      rows = r.rows
+      headers = r.headers
+      for (const [k, v] of r.highlights) highlights.set(k, v)
+      addedHeaders = [...new Set([...addedHeaders, ...r.addedHeaders])]
+      targetHeaders = [...new Set([...targetHeaders, ...r.targetHeaders])]
+      last = r
+    }
+    return {
+      ...last, rows, headers, highlights, addedHeaders, targetHeaders,
+      source: base.workbook ? base : null,
+    }
+  }, [base, callFiles, map, carry])
+
+  const projects = useMemo(
+    () => (result && map.projectCol ? groupByProject(result.rows, map.projectCol) : new Map()),
+    [result, map.projectCol],
+  )
+  const missingStandard = useMemo(
+    () => {
+      const all = new Set(callFiles.flatMap((t) => t.headers))
+      return callFiles.length ? DEFAULT_CALL_COLUMNS.filter((h) => !all.has(h)) : []
+    },
+    [callFiles],
+  )
+
+  const stem = base?.name.replace(/\.(csv|xlsx?)$/i, '') ?? 'contacts'
+  const tag = scopeTag(scope)
+  const scopeRows = scope ? projects.get(scope)?.length ?? 0 : result?.rows.length ?? 0
+  const st = result?.stats
+  const changed = result ? result.preview.filter((p) => p.changed) : []
+  const nameCols = useMemo(
+    () => (base?.headers ?? []).filter((h) => /name/i.test(h)).slice(0, 2),
+    [base],
+  )
+  const callCols = [...new Set(callFiles.flatMap((t) => t.headers))].filter((h) => h !== map.callKey)
 
   async function save(kind) {
     setSaving(kind)
     try {
-      if (kind === 'xlsx') await downloadXlsx(result, `${stem}-merged.xlsx`)
-      else downloadCsv(result, `${stem}-merged.csv`)
+      const idx = scope ? projects.get(scope) : null
+      const payload = idx ? sliceResult(result, idx) : result
+      if (kind === 'xlsx') await downloadXlsx(payload, `${stem}-merged${tag}.xlsx`)
+      else downloadCsv(payload, `${stem}-merged${tag}.csv`)
       setErrors((e) => ({ ...e, save: null }))
     } catch (err) {
-      setErrors((e) => ({ ...e, save: `Could not build the ${kind.toUpperCase()}: ${err.message}` }))
+      setErrors((e) => ({ ...e, save: `Could not build the file: ${err.message}` }))
     } finally {
       setSaving('')
     }
   }
 
-  const nameCols = useMemo(
-    () => (base?.headers ?? []).filter((h) => /name|email/i.test(h)).slice(0, 2),
-    [base],
-  )
-  const missingStandard = useMemo(
-    () => (calls ? DEFAULT_CALL_COLUMNS.filter((h) => !calls.headers.includes(h)) : []),
-    [calls],
-  )
-  const sameFile = base && calls && base.name === calls.name
-  const stem = base?.name.replace(/\.(csv|xlsx?)$/i, '') ?? 'merged'
-  const st = result?.stats
-  const changedRows = result ? result.preview.filter((p) => p.changed) : []
-
   return (
     <div className="app">
       <header>
         <h1>Call Report Merger</h1>
-        <p>Folds a HubSpot calls export into your base contacts file, keeping a dated notes history per contact.</p>
+        <p>Drop in your HubSpot contacts and calls exports. The merged file is ready straight away.</p>
       </header>
 
-      <section>
-        <h2><span className="step">1</span> Load the two exports</h2>
-        <div className="drops">
-          <Drop
-            label="Base contacts file"
-            hint="The file that gets updated. One row per contact, keyed by Record ID."
-            file={base} error={errors.base} busy={loading.base} onFile={(f) => load('base', f)}
-          />
-          <Drop
-            label="Calls export"
-            hint="The call activity to merge in. Extra columns are ignored."
-            file={calls} error={errors.calls} busy={loading.calls} onFile={(f) => load('calls', f)}
-          />
-        </div>
-        {sameFile && (
-          <div className="warn-box plain">
-            Both slots have a file called <strong>{base.name}</strong>. That is almost certainly a
-            mistake &mdash; the base is your contacts list, the other is the calls export.
-          </div>
-        )}
-      </section>
-
-      {base && calls && (
-        <section>
-          <h2><span className="step">2</span> Check the column mapping</h2>
-          <p className="sub">Auto-detected from the headers. Change these if a future export names things differently.</p>
-          <div className="fields">
-            <Select label="Base &mdash; contact ID" value={map.baseKey} options={base.headers}
-              onChange={(v) => setMap((m) => ({ ...m, baseKey: v }))} />
-            <Select label="Calls &mdash; contact ID" value={map.callKey} options={calls.headers}
-              note="Not the call&rsquo;s own Record ID"
-              onChange={(v) => setMap((m) => ({ ...m, callKey: v }))} />
-            <Select label="Calls &mdash; date" value={map.dateCol} options={calls.headers}
-              note="Groups the calls into days"
-              onChange={(v) => setMap((m) => ({ ...m, dateCol: v }))} />
-            <Select label="Calls &mdash; notes" value={map.notesCol} options={calls.headers}
-              note="The one column that accumulates"
-              onChange={(v) => setMap((m) => ({ ...m, notesCol: v }))} />
-          </div>
-
-          {missingStandard.length > 0 && (
-            <div className="warn-box plain">
-              <strong>{missingStandard.join(', ')}</strong>{' '}
-              {missingStandard.length === 1 ? 'is' : 'are'} not in this calls export, so{' '}
-              {missingStandard.length === 1 ? 'that column' : 'those columns'} will be missing from the
-              report. Re-export from HubSpot with {missingStandard.length === 1 ? 'it' : 'them'} included,
-              or tick a replacement below.
+      {/* ---------------------------------------------------------- files */}
+      <div className="zones">
+        <DropZone
+          step="1" title="Contacts" filled={!!base} busy={loading.base} error={errors.base}
+          hint="The file that gets updated — one row per contact."
+          onFile={(f) => load('base', f)}
+        >
+          {base && (
+            <div className="file">
+              <span className="file-name">{base.name}</span>
+              <span className="file-meta">{n(base.rows.length)} contacts · {base.headers.length} columns</span>
             </div>
           )}
+        </DropZone>
 
-          {map.notesCol && !carry.includes(map.notesCol) && (
-            <div className="warn-box plain">
-              <strong>{targetColumn(map.notesCol)}</strong> is unticked below, so no notes history will be
-              written this run. Tick it to keep the notes column.
+        <div className="zones-plus">+</div>
+
+        <DropZone
+          step="2" title="Calls" filled={callFiles.length > 0} busy={loading.calls} error={errors.calls}
+          hint="The call activity to add in."
+          onFile={(f) => load('calls', f)}
+        >
+          {callFiles.map((t) => (
+            <div className="file" key={t.name}>
+              <span className="file-name">{t.name}</span>
+              <span className="file-meta">{n(t.rows.length)} calls</span>
+              <button
+                className="file-x" title="Remove this file"
+                onClick={() => setCallFiles((fs) => fs.filter((f) => f.name !== t.name))}
+              >×</button>
             </div>
+          ))}
+          {callFiles.length > 0 && (
+            <div className="zone-hint">Add another export to combine several days.</div>
           )}
+        </DropZone>
+      </div>
 
-          <div className="picker">
-            <div className="picker-head">
-              <span className="field-label">Call columns to add &mdash; {carry.length} selected</span>
-              <button className="link" onClick={() => setCarry(defaultCarryColumns(calls.headers, map.callKey))}>
-                Reset to the standard {DEFAULT_CALL_COLUMNS.length}
-              </button>
-            </div>
-            <div className="chips">
-              {calls.headers.filter((h) => h !== map.callKey).map((h) => {
-                const on = carry.includes(h)
-                return (
-                  <label key={h} className={`chip ${on ? 'on' : ''}`}>
-                    <input
-                      type="checkbox" checked={on}
-                      onChange={() => setCarry((c) => (on ? c.filter((x) => x !== h) : [...c, h]))}
-                    />
-                    {targetColumn(h)}
-                  </label>
-                )
-              })}
-            </div>
-          </div>
-
-          <ul className="rules">
-            <li><strong>{map.notesCol || 'Notes'}</strong> from every day in this export are merged in &mdash; a calls export is usually full history, not just today, so nothing gets dropped.</li>
-            <li>Each day&rsquo;s notes are joined together (oldest call first, duplicates dropped) and <strong>added on top of the notes already in the base</strong>, under a <code>[date]</code> heading, newest day first.</li>
-            <li>Re-merging a day replaces just that day&rsquo;s block &mdash; running the same export twice changes nothing.</li>
-            <li>Every other call column takes the <strong>latest non-blank</strong> value from the contact&rsquo;s single most recent day &mdash; those columns hold the latest only, not a history.</li>
-            <li>Existing base columns are never touched &mdash; their values, date formats and widths are left exactly as they are.</li>
-          </ul>
-
-          <div className="runbar">
-            <button className="primary" disabled={!ready || busy} onClick={run}>
-              {busy ? 'Merging…' : work ? 'Merge this file too' : 'Merge'}
+      {/* ------------------------------------------------------- settings */}
+      {base && callFiles.length > 0 && (
+        <div className={`tune ${tuning ? 'open' : ''}`}>
+          <div className="tune-bar">
+            <p className="tune-say">
+              Adding <strong>{carry.length}</strong> call {carry.length === 1 ? 'column' : 'columns'}
+              {map.splitCol && <>, splitting <strong>{map.splitCol}</strong> into date + time</>}
+              , matching on <strong>{map.callKey || '?'}</strong> → <strong>{map.baseKey || '?'}</strong>.
+            </p>
+            <button className="ghost" onClick={() => setTuning((v) => !v)}>
+              {tuning ? 'Done' : 'Change'}
             </button>
-            {!ready && <span className="field-note">Still need {blockers.join(', ')}.</span>}
-            {work && ready && !busy && (
-              <span className="field-note">Builds on what you have already merged this session.</span>
-            )}
           </div>
-          {errors.merge && <div className="alert">{errors.merge}</div>}
-        </section>
+
+          {tuning && (
+            <div className="tune-body">
+              <div className="tune-group">
+                <div className="tune-head">
+                  <h3>Call columns to add</h3>
+                  <button className="link" onClick={() => setCarry(defaultCarryColumns(callFiles.at(-1).headers, map.callKey))}>
+                    Reset to the standard {DEFAULT_CALL_COLUMNS.length}
+                  </button>
+                </div>
+                <div className="chips">
+                  {callCols.map((h) => (
+                    <Chip
+                      key={h} on={carry.includes(h)}
+                      onToggle={() => setCarry((c) => (c.includes(h) ? c.filter((x) => x !== h) : [...c, h]))}
+                    >{targetColumn(h)}</Chip>
+                  ))}
+                </div>
+              </div>
+
+              <div className="tune-group">
+                <h3>Split a date into two columns</h3>
+                <div className="fields">
+                  <Field
+                    label="Date column" value={map.splitCol} options={base.headers}
+                    noneLabel="— don’t split anything —"
+                    note={map.splitCol
+                      ? `Adds ${splitTargets(map.splitCol).join(' and ')}, leaving the original alone`
+                      : 'A timestamp like 2026-09-09 07:49 is almost unfilterable in Excel'}
+                    onChange={(v) => setMap((m) => ({ ...m, splitCol: v }))}
+                  />
+                </div>
+              </div>
+
+              <div className="tune-group">
+                <h3>Column matching <span className="tune-auto">detected automatically</span></h3>
+                <div className="fields">
+                  <Field label="Contacts — contact ID" value={map.baseKey} options={base.headers}
+                    onChange={(v) => setMap((m) => ({ ...m, baseKey: v }))} />
+                  <Field label="Calls — contact ID" value={map.callKey} options={callCols.concat(map.callKey || [])}
+                    note="Not the call’s own Record ID"
+                    onChange={(v) => setMap((m) => ({ ...m, callKey: v }))} />
+                  <Field label="Calls — date" value={map.dateCol} options={callCols}
+                    note="Groups calls into days"
+                    onChange={(v) => setMap((m) => ({ ...m, dateCol: v }))} />
+                  <Field label="Calls — notes" value={map.notesCol} options={callCols}
+                    note="The column that builds up history"
+                    onChange={(v) => setMap((m) => ({ ...m, notesCol: v }))} />
+                  <Field label="Contacts — project" value={map.projectCol} options={base.headers}
+                    note="Powers the per-project export below"
+                    onChange={(v) => { setMap((m) => ({ ...m, projectCol: v })); setScope('') }} />
+                </div>
+              </div>
+            </div>
+          )}
+        </div>
       )}
 
-      {result && (
-        <section>
-          <h2><span className="step">3</span> Review and download</h2>
-
-          <div className="stats">
-            <Stat n={st.contactsUpdated} label="contacts updated" tone={st.contactsUpdated ? 'good' : 'warn'} />
-            <Stat n={st.historyDaysMerged} label="call-days added to notes" />
-            <Stat n={st.contactsAlreadyCurrent} label="already up to date" muted />
-            <Stat n={st.unmatched.length} label="IDs not in base" tone={st.unmatched.length ? 'warn' : ''} />
-            <Stat n={st.noContactId} label="calls with no contact ID" muted />
-          </div>
-
-          {st.contactsUpdated === 0 && (
-            <div className="warn-box plain">
-              <strong>Nothing changed.</strong>{' '}
-              {st.contactsAlreadyCurrent > 0
-                ? 'Every matching contact already has this call data — merging the same export twice is a no-op, so this is expected if you have already run it.'
-                : 'No call in this export matched a contact in the base. Check that the two contact ID columns in step 2 point at real HubSpot Record IDs.'}
-            </div>
-          )}
-
-          {(st.mangledCallIds > 0 || st.mangledBaseIds > 0) && (
-            <div className="warn-box plain">
-              <strong>Excel has damaged some Record IDs.</strong>{' '}
-              {st.mangledCallIds > 0 && `${st.mangledCallIds} ID${st.mangledCallIds === 1 ? '' : 's'} in the calls export `}
-              {st.mangledCallIds > 0 && st.mangledBaseIds > 0 && 'and '}
-              {st.mangledBaseIds > 0 && `${st.mangledBaseIds} in the base `}
-              look like <code>1.14178E+11</code> instead of a 12-digit number. That happens when a CSV is
-              opened and re-saved in Excel, and those rows can never match. Re-export from HubSpot as
-              .xlsx, or open the CSV without saving it.
-            </div>
-          )}
-
-          {st.notesTrimmed > 0 && (
-            <div className="warn-box plain">
-              <strong>{st.notesTrimmed} contact{st.notesTrimmed === 1 ? "'s" : "s'"} notes hit Excel&rsquo;s cell limit.</strong>{' '}
-              Excel refuses to open a file with a cell over 32,767 characters, so the oldest days were
-              dropped from {st.notesTrimmed === 1 ? 'that cell' : 'those cells'} to keep the file valid.
-              The full history is still in HubSpot.
-            </div>
-          )}
-
-          {st.duplicateBaseIds.length > 0 && (
-            <details className="warn-box">
-              <summary>
-                {st.duplicateBaseIds.length} contact ID{st.duplicateBaseIds.length === 1 ? ' appears' : 's appear'} more
-                than once in the base &mdash; only the last row of each got the call data
-              </summary>
-              <div className="idlist">{st.duplicateBaseIds.map((u) => `${u.id} (${u.count}×)`).join('   ')}</div>
-            </details>
-          )}
-
-          <p className="sub">
-            {result.addedHeaders.length
-              ? <>Appended {result.addedHeaders.length} new columns: <strong>{result.addedHeaders.join(', ')}</strong></>
-              : <>No new columns &mdash; every call column already existed and was updated in place.</>}
-          </p>
-
-          {st.unmatched.length > 0 && (
-            <details className="warn-box">
-              <summary>
-                {st.unmatched.length} contact IDs in the calls file have no row in the base &mdash; nothing was written for them
-              </summary>
-              <div className="idlist">{st.unmatched.map((u) => `${u.id} (${u.count})`).join('   ')}</div>
-            </details>
-          )}
-
-          <div className="legend">
-            <span><i className="sw new" /> new value or a day appended</span>
-            <span><i className="sw updated" /> replaced an existing value</span>
-            <span><i className="sw header" /> new column</span>
-            <span className="legend-note">highlights appear in the .xlsx only &mdash; CSV has no cell colours</span>
-          </div>
-
-          {changedRows.length > 0 && (
-            <>
-              <div className="tablewrap">
-                <table>
-                  <thead>
-                    <tr>
-                      <th>{map.baseKey}</th>
-                      {nameCols.map((h) => <th key={h}>{h}</th>)}
-                      <th>Latest day</th>
-                      <th className="num">Days merged</th>
-                      <th>Notes added this run</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {changedRows.slice(0, 100).map((p) => (
-                      <tr key={p.id}>
-                        <td className="mono">{p.id}</td>
-                        {nameCols.map((h) => <td key={h}>{result.rows[p.rowIndex][h]}</td>)}
-                        <td className="mono">{p.day}</td>
-                        <td className="num">{p.daysMerged}</td>
-                        <td className="notes">{p.newNotes || <em>no notes</em>}</td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
-              {changedRows.length > 100 && (
-                <p className="sub">Showing the 100 most recent of {changedRows.length.toLocaleString()} updated contacts.</p>
-              )}
-            </>
-          )}
-
-          <div className="downloads">
-            <button className="primary" disabled={!!saving} onClick={() => save('xlsx')}>
-              {saving === 'xlsx' ? 'Building…' : <>Download .xlsx<small>with highlights</small></>}
-            </button>
-            <button disabled={!!saving} onClick={() => save('csv')}>
-              {saving === 'csv' ? 'Building…' : <>Download .csv<small>plain, import-ready</small></>}
-            </button>
-            {baseFile && (
-              <button className="link reset" onClick={() => { setResult(null); setWork(null); load('base', baseFile) }}>
-                Start over from the uploaded base
-              </button>
-            )}
-          </div>
-          {errors.save && <div className="alert">{errors.save}</div>}
-        </section>
+      {/* --------------------------------------------------------- result */}
+      {!result ? (
+        <div className="waiting">
+          {base || callFiles.length
+            ? <>Add the {base ? 'calls' : 'contacts'} file and your merged result appears here.</>
+            : <>Your merged file will appear here.</>}
+        </div>
+      ) : (
+        <ResultView
+          result={result} map={map} carry={carry} projects={projects}
+          scope={scope} onScope={setScope} saving={saving} onSave={save}
+          stem={stem} nameCols={nameCols} missingStandard={missingStandard}
+          saveError={errors.save}
+          onStartOver={baseFile ? () => { setCallFiles([]); load('base', baseFile) } : null}
+        />
       )}
     </div>
   )

@@ -5,6 +5,7 @@ import * as XLSX from 'xlsx'
 import {
   merge, parseWhen, cellText, targetColumn, defaultCarryColumns,
   mergeNoteHistory, parseNoteBlocks, wasTrimmed,
+  splitTargets, detectSplitDateColumn, detectProjectColumn, groupByProject, sliceResult, NO_PROJECT,
   detectBaseKeyColumn, detectCallKeyColumn, detectDateColumn, detectNotesColumn,
 } from './merge.js'
 import { readTable } from './readTable.js'
@@ -363,6 +364,104 @@ assert.equal(r.stats.mangledCallIds, 0, 'a normal 12-digit id is not mistaken fo
 
   fs.unlinkSync(out)
   console.log('xlsx round trip: base cells preserved, highlights repaint cleanly')
+}
+
+
+/* ---------- Create Date split into date + time ---------- */
+{
+  assert.deepEqual(parseWhen('9/9/2026 07:49'), { ms: parseWhen('9/9/2026 07:49').ms, day: '2026-09-09', time: '07:49' })
+  assert.equal(parseWhen(new Date(Date.UTC(2026, 8, 9, 7, 49))).time, '07:49')
+  assert.equal(parseWhen('8/3/2026 5:06 PM').time, '17:06')
+  assert.equal(parseWhen('8/3/2026').time, '', 'a date with no clock must not invent 00:00')
+  assert.equal(parseWhen('nonsense').time, '')
+  assert.deepEqual(splitTargets('Create Date'), ['Create Date (Date)', 'Create Date (Time)'])
+  assert.equal(detectSplitDateColumn(['Record ID', 'Last Activity Date', 'Create Date']), 'Create Date')
+
+  const sd = merge({
+    baseHeaders: ['Record ID', 'Create Date'],
+    baseRows: [
+      { 'Record ID': '111', 'Create Date': new Date(Date.UTC(2026, 8, 9, 7, 49)) },
+      { 'Record ID': '222', 'Create Date': '8/3/2026 17:06' },
+      { 'Record ID': '333', 'Create Date': '' },
+    ],
+    callHeaders: ['Associated Contact IDs', 'Activity date', 'Call notes'],
+    callRows: [{ 'Associated Contact IDs': '111', 'Activity date': '9/9/2026 10:00', 'Call notes': 'hi' }],
+    baseKey: 'Record ID', callKey: 'Associated Contact IDs', dateCol: 'Activity date', notesCol: 'Call notes',
+    splitDateColumns: ['Create Date'],
+  })
+  // appended, so the original column and every base column keep their position
+  assert.deepEqual(sd.headers.slice(0, 2), ['Record ID', 'Create Date'])
+  assert.deepEqual(sd.headers.slice(-2), ['Create Date (Date)', 'Create Date (Time)'])
+  assert.deepEqual(sd.rows.map((x) => x['Create Date (Date)']), ['2026-09-09', '2026-08-03', ''])
+  assert.deepEqual(sd.rows.map((x) => x['Create Date (Time)']), ['07:49', '17:06', ''])
+  // it covers every row, not just contacts that had calls
+  assert.equal(sd.stats.contactsUpdated, 1)
+  assert.ok(sd.rows[1]['Create Date (Date)'], 'a contact with no calls still gets the split')
+  assert.equal(sd.rows[0]['Create Date'] instanceof Date, true, 'the source column is untouched')
+  assert.ok(sd.targetHeaders.includes('Create Date (Time)'), 'split cells must be written to the xlsx')
+
+  // re-running must not duplicate the columns or split a split column
+  const sd2 = merge({
+    baseHeaders: sd.headers, baseRows: sd.rows,
+    callHeaders: ['Associated Contact IDs', 'Activity date', 'Call notes'],
+    callRows: [{ 'Associated Contact IDs': '111', 'Activity date': '9/9/2026 10:00', 'Call notes': 'hi' }],
+    baseKey: 'Record ID', callKey: 'Associated Contact IDs', dateCol: 'Activity date', notesCol: 'Call notes',
+    splitDateColumns: ['Create Date', 'Create Date (Date)'],
+  })
+  assert.deepEqual(sd2.addedHeaders, [])
+  assert.equal(sd2.headers.filter((h) => h === 'Create Date (Date)').length, 1)
+  assert.ok(!sd2.headers.includes('Create Date (Date) (Date)'))
+
+  // off by default: no split column named, no extra columns
+  const noSplit = merge({
+    baseHeaders: ['Record ID', 'Create Date'], baseRows: [{ 'Record ID': '111', 'Create Date': '8/3/2026 17:06' }],
+    callHeaders: ['Associated Contact IDs', 'Activity date', 'Call notes'], callRows: [],
+    baseKey: 'Record ID', callKey: 'Associated Contact IDs', dateCol: 'Activity date', notesCol: 'Call notes',
+  })
+  assert.ok(!noSplit.headers.some((h) => h.endsWith('(Date)')))
+}
+
+/* ---------- download by project ---------- */
+{
+  assert.equal(detectProjectColumn(['Record ID', 'Associated Project IDs', 'Associated Project']), 'Associated Project')
+  assert.equal(detectProjectColumn(['Record ID', 'Associated Project IDs']), '')
+
+  const pr = merge({
+    baseHeaders: ['Record ID', 'Associated Project'],
+    baseRows: [
+      { 'Record ID': '111', 'Associated Project': 'Blue Coats' },
+      { 'Record ID': '222', 'Associated Project': '' },
+      { 'Record ID': '333', 'Associated Project': 'Blue Coats;Red Team' },
+    ],
+    callHeaders: ['Associated Contact IDs', 'Activity date', 'Call notes'],
+    callRows: [
+      { 'Associated Contact IDs': '333', 'Activity date': '9/9/2026 10:00', 'Call notes': 'c' },
+      { 'Associated Contact IDs': '222', 'Activity date': '9/9/2026 10:00', 'Call notes': 'b' },
+    ],
+    baseKey: 'Record ID', callKey: 'Associated Contact IDs', dateCol: 'Activity date', notesCol: 'Call notes',
+  })
+
+  const groups = groupByProject(pr.rows, 'Associated Project')
+  // a contact on two projects appears in both; unassigned rows get their own bucket, listed last
+  assert.deepEqual([...groups.keys()], ['Blue Coats', 'Red Team', NO_PROJECT])
+  assert.deepEqual(groups.get('Blue Coats'), [0, 2])
+  assert.deepEqual(groups.get('Red Team'), [2])
+  assert.deepEqual(groups.get(NO_PROJECT), [1])
+
+  const blue = sliceResult(pr, groups.get('Blue Coats'))
+  assert.deepEqual(blue.rows.map((x) => x['Record ID']), ['111', '333'])
+  assert.deepEqual(blue.headers, pr.headers, 'a subset keeps every column')
+  assert.equal(blue.source, null, 'a subset must build a fresh workbook, not patch the original')
+  // row 2 of the full result carried the highlight; it is row 1 of this subset
+  assert.equal(pr.highlights.get('2:Call notes'), 'new')
+  assert.equal(blue.highlights.get('1:Call notes'), 'new')
+  assert.equal(blue.highlights.get('2:Call notes'), undefined, 'highlights outside the subset are dropped')
+  assert.equal(pr.rows.length, 3, 'slicing must not mutate the original result')
+
+  // a file where nobody has a project still produces one honest bucket
+  const none = groupByProject([{ p: '' }, { p: '   ' }], 'p')
+  assert.deepEqual([...none.keys()], [NO_PROJECT])
+  assert.deepEqual(none.get(NO_PROJECT), [0, 1])
 }
 
 console.log('all checks passed')

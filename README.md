@@ -53,6 +53,33 @@ For each contact:
    rest hold the latest value, not a history.
 4. Results are appended as new `Call …` columns.
 
+## Splitting a date column
+
+A HubSpot timestamp like `2026-09-09 07:49` is unfilterable in Excel — 3,102 contacts
+produce ~2,900 distinct values. Pick a base column in step 2 (defaults to `Create Date`)
+and two text columns are appended beside it:
+
+| | |
+|---|---|
+| `Create Date (Date)` | `2026-09-09` — collapses ~2,900 values to ~120 days |
+| `Create Date (Time)` | `07:49`, blank when the source had no clock |
+
+The original column is never modified, and the split covers every row, not just
+contacts that had calls. Both are written as text in `YYYY-MM-DD` / `HH:MM`, which
+sorts and filters correctly without Excel reinterpreting anything.
+
+## Downloading one project
+
+Step 3 has a **Rows to download** picker built from the base's project column
+(`Associated Project` by default), listing each project with its row count plus a
+`(no project)` bucket. Choosing one narrows both downloads to those rows and tags
+the filename. A contact associated with several projects — HubSpot joins them with
+`;` — appears under each.
+
+A project subset is written as a **fresh** workbook rather than patched into your
+original file, so the base's own date formats and column widths aren't carried
+over on that export. The full download is unaffected.
+
 When the base is `.xlsx`, the new columns are written **into the original workbook**:
 existing cells keep their own values, date formats and column widths, because they
 are never read back and rewritten. `npm test` asserts this cell by cell.

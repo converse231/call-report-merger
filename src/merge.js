@@ -61,18 +61,22 @@ export function parseWhen(value) {
     return {
       ms: value.getTime(),
       day: `${value.getUTCFullYear()}-${pad(value.getUTCMonth() + 1)}-${pad(value.getUTCDate())}`,
+      time: `${pad(value.getUTCHours())}:${pad(value.getUTCMinutes())}`,
     }
   }
   const t = norm(value)
-  if (!t) return { ms: 0, day: UNKNOWN_DAY }
+  if (!t) return { ms: 0, day: UNKNOWN_DAY, time: '' }
 
   let y, mo, d, h = 0, mi = 0, s = 0, ampm = null
+  let hasTime = false
   let m = t.match(/^(\d{4})-(\d{2})-(\d{2})(?:[ T](\d{1,2}):(\d{2})(?::(\d{2}))?)?/)
   if (m) {
+    hasTime = m[4] !== undefined
     ;[, y, mo, d, h = 0, mi = 0, s = 0] = m
   } else {
     m = t.match(/^(\d{1,2})\/(\d{1,2})\/(\d{2,4})(?:[ ,]+(\d{1,2}):(\d{2})(?::(\d{2}))?\s*([AaPp][Mm])?)?/)
-    if (!m) return { ms: 0, day: UNKNOWN_DAY }
+    if (!m) return { ms: 0, day: UNKNOWN_DAY, time: '' }
+    hasTime = m[4] !== undefined
     ;[, mo, d, y, h = 0, mi = 0, s = 0, ampm] = m
   }
 
@@ -87,6 +91,8 @@ export function parseWhen(value) {
   return {
     ms: new Date(y, mo - 1, d, h, mi, s).getTime(),
     day: `${y}-${pad(mo)}-${pad(d)}`,
+    // a date with no clock in the source stays blank rather than inventing 00:00
+    time: hasTime ? `${pad(h)}:${pad(mi)}` : '',
   }
 }
 
@@ -127,6 +133,69 @@ export function detectDateColumn(callHeaders) {
 
 export function detectNotesColumn(callHeaders) {
   return callHeaders.find((h) => /note/i.test(h)) ?? ''
+}
+
+/**
+ * A timestamp like "2026-09-09 07:49" is unfilterable in Excel -- 3,102 contacts
+ * give ~2,900 distinct values. Splitting the day out collapses that to ~120.
+ * The source column is never modified; these are appended alongside it.
+ */
+export const splitTargets = (col) => [`${col} (Date)`, `${col} (Time)`]
+
+export function detectSplitDateColumn(baseHeaders) {
+  return (
+    baseHeaders.find((h) => /^create\s*date$/i.test(h)) ??
+    baseHeaders.find((h) => /date/i.test(h) && !splitTargets('').some((s) => h.endsWith(s.trim()))) ??
+    ''
+  )
+}
+
+export function detectProjectColumn(baseHeaders) {
+  return (
+    baseHeaders.find((h) => /^associated project$/i.test(h)) ??
+    baseHeaders.find((h) => /project/i.test(h) && !/\bids?$/i.test(h)) ??
+    ''
+  )
+}
+
+export const NO_PROJECT = '(no project)'
+
+/**
+ * project name -> row indexes. HubSpot joins multiple associations with ";",
+ * so a contact on two projects lands in both groups.
+ */
+export function groupByProject(rows, col) {
+  const groups = new Map()
+  rows.forEach((r, i) => {
+    const raw = cellText(r[col])
+    const names = raw ? [...new Set(raw.split(';').map((s) => s.trim()).filter(Boolean))] : []
+    for (const name of names.length ? names : [NO_PROJECT]) {
+      if (!groups.has(name)) groups.set(name, [])
+      groups.get(name).push(i)
+    }
+  })
+  // real projects first, alphabetically; the unassigned bucket last
+  return new Map(
+    [...groups.entries()].sort(([a], [b]) =>
+      a === NO_PROJECT ? 1 : b === NO_PROJECT ? -1 : a.localeCompare(b)),
+  )
+}
+
+/** Narrow a merge result to a subset of its rows, keeping highlights aligned. */
+export function sliceResult(result, rowIndexes) {
+  const moved = new Map(rowIndexes.map((src, dst) => [src, dst]))
+  const highlights = new Map()
+  for (const [key, kind] of result.highlights) {
+    const cut = key.indexOf(':')
+    const dst = moved.get(Number(key.slice(0, cut)))
+    if (dst !== undefined) highlights.set(`${dst}:${key.slice(cut + 1)}`, kind)
+  }
+  return {
+    ...result,
+    rows: rowIndexes.map((i) => result.rows[i]),
+    highlights,
+    source: null, // a subset can't be written back into the original workbook
+  }
 }
 
 /** The default 8, minus anything this particular export doesn't have. */
@@ -217,12 +286,16 @@ function fitToCell(blocks) {
  * into the notes history, and fill every other call column with the latest
  * non-empty value from that day.
  */
-export function merge({ baseRows, baseHeaders, callRows, callHeaders, baseKey, callKey, dateCol, notesCol, carryColumns }) {
+export function merge({ baseRows, baseHeaders, callRows, callHeaders, baseKey, callKey, dateCol, notesCol, carryColumns, splitDateColumns }) {
   const wanted = new Set(carryColumns ?? defaultCarryColumns(callHeaders, callKey))
   const carried = callHeaders.filter((h) => h !== callKey && wanted.has(h))
+  // Only split base columns that exist, and never a split column we made earlier.
+  const splitCols = (splitDateColumns ?? [])
+    .filter((c) => c && baseHeaders.includes(c) && !/ \((Date|Time)\)$/.test(c))
+  const splitCells = splitCols.flatMap(splitTargets)
+
   const newHeaders = [...baseHeaders]
-  for (const h of carried) {
-    const t = targetColumn(h)
+  for (const t of [...carried.map(targetColumn), ...splitCells]) {
     if (!newHeaders.includes(t)) newHeaders.push(t)
   }
   const addedHeaders = newHeaders.filter((h) => !baseHeaders.includes(h))
@@ -349,12 +422,23 @@ export function merge({ baseRows, baseHeaders, callRows, callHeaders, baseKey, c
     preview.push({ rowIndex, id, day: latestDay, callCount: latestCalls.length, daysMerged: allDays.length, values, newNotes, changed })
   }
 
+  // Date/time split runs over every row, not just contacts with calls -- it is a
+  // view of a base column, not call data.
+  for (const col of splitCols) {
+    const [dateCell, timeCell] = splitTargets(col)
+    for (const row of rows) {
+      const when = parseWhen(row[col])
+      row[dateCell] = when.day === UNKNOWN_DAY ? '' : when.day
+      row[timeCell] = when.time
+    }
+  }
+
   for (const row of rows) for (const h of newHeaders) if (row[h] == null) row[h] = ''
 
   return {
     headers: newHeaders,
     addedHeaders,
-    targetHeaders: carried.map(targetColumn),
+    targetHeaders: [...carried.map(targetColumn), ...splitCells],
     rows,
     highlights,
     preview: preview.sort((a, b) => (a.day < b.day ? 1 : a.day > b.day ? -1 : 0)),

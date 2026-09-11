@@ -7,7 +7,7 @@
     "dev": "vite",
     "build": "vite build",
     "preview": "vite preview",
-    "test": "node src/merge.test.mjs"
+    "test": "node src/merge.test.mjs && node src/ui.test.mjs"
   },
   "dependencies": {
     "exceljs": "^4.4.0",
