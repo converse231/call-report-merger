@@ -305,16 +305,22 @@ export function merge({ baseRows, baseHeaders, callRows, callHeaders, baseKey, c
   // isn't in the output.
   const notesActive = Boolean(notesCol) && carried.includes(notesCol)
 
-  // contact id -> row index (last wins if the base has duplicates)
+  // contact id -> every row with that id. A contact exported once per project
+  // appears on several rows; each one is a real row in its own project's export,
+  // so all of them get the call data rather than just the last.
   const index = new Map()
   const duplicateIds = new Map()
   let mangledBaseIds = 0
   baseRows.forEach((r, i) => {
     const id = normId(r[baseKey])
     if (!id) return
-    if (index.has(id)) duplicateIds.set(id, (duplicateIds.get(id) ?? 1) + 1)
+    if (index.has(id)) {
+      index.get(id).push(i)
+      duplicateIds.set(id, index.get(id).length)
+    } else {
+      index.set(id, [i])
+    }
     if (MANGLED_ID.test(id)) mangledBaseIds++
-    index.set(id, i)
   })
 
   // Bucket calls by contact, then by day. A calls export is typically a full
@@ -352,22 +358,13 @@ export function merge({ baseRows, baseHeaders, callRows, callHeaders, baseKey, c
   let notesTrimmed = 0
 
   for (const [id, days] of byContact) {
-    const rowIndex = index.get(id)
-    const row = rows[rowIndex]
     const allDays = [...days.keys()].sort() // ascending
     const latestDay = allDays[allDays.length - 1]
     const latestCalls = days.get(latestDay).sort((a, b) => a.when.ms - b.when.ms)
 
-    const values = {}
-    const kindHint = {}
-    const addedThisRun = [] // {day, text} for the preview -- only what actually changed
-
+    // One day's notes read the same whichever row they land on, so build them once.
+    const dayTexts = []
     if (notesActive) {
-      const target = targetColumn(notesCol)
-      let existing = row[target]
-      let anyNew = false
-      let anyUpdated = false
-
       for (const day of allDays) {
         const dayCalls = days.get(day).sort((a, b) => a.when.ms - b.when.ms)
         const seen = new Set()
@@ -376,50 +373,70 @@ export function merge({ baseRows, baseHeaders, callRows, callHeaders, baseKey, c
           const n = norm(call[notesCol])
           if (n && !seen.has(n)) { seen.add(n); notes.push(n) }
         }
-        const dayText = notes.join('\n\n')
-        if (!dayText) continue
-        const alreadyHadDay = parseNoteBlocks(existing).some((b) => b.day === day)
-        const before = norm(existing)
-        existing = mergeNoteHistory(existing, day, dayText)
-        if (existing === before) continue // already on file verbatim -- not a change
-        if (alreadyHadDay) anyUpdated = true; else anyNew = true
-        addedThisRun.push({ day, text: dayText })
-        historyDaysMerged++
+        const text = notes.join('\n\n')
+        if (text) dayTexts.push({ day, text })
+      }
+    }
+
+    const daysChanged = new Set()
+    for (const rowIndex of index.get(id)) {
+      const row = rows[rowIndex]
+
+      const values = {}
+      const kindHint = {}
+      const addedThisRun = [] // {day, text} for the preview -- only what actually changed
+
+      if (notesActive) {
+        const target = targetColumn(notesCol)
+        let existing = row[target]
+        let anyNew = false
+        let anyUpdated = false
+
+        for (const { day, text: dayText } of dayTexts) {
+          const alreadyHadDay = parseNoteBlocks(existing).some((b) => b.day === day)
+          const before = norm(existing)
+          existing = mergeNoteHistory(existing, day, dayText)
+          if (existing === before) continue // already on file verbatim -- not a change
+          if (alreadyHadDay) anyUpdated = true; else anyNew = true
+          addedThisRun.push({ day, text: dayText })
+          daysChanged.add(day)
+        }
+
+        values[target] = existing
+        if (wasTrimmed(existing)) notesTrimmed++
+        // Appending a day is new data, not a replacement -- only re-merging a day
+        // that is already on file overwrites anything.
+        if (anyNew) kindHint[target] = 'new'
+        else if (anyUpdated) kindHint[target] = 'updated'
       }
 
-      values[target] = existing
-      if (wasTrimmed(existing)) notesTrimmed++
-      // Appending a day is new data, not a replacement -- only re-merging a day
-      // that is already on file overwrites anything.
-      if (anyNew) kindHint[target] = 'new'
-      else if (anyUpdated) kindHint[target] = 'updated'
-    }
-
-    for (const h of carried) {
-      if (notesActive && h === notesCol) continue
-      // latest non-empty: "latest wins", without blanking a field the last call left empty
-      let v = ''
-      for (let i = latestCalls.length - 1; i >= 0; i--) {
-        const c = norm(latestCalls[i].call[h])
-        if (c) { v = c; break }
+      for (const h of carried) {
+        if (notesActive && h === notesCol) continue
+        // latest non-empty: "latest wins", without blanking a field the last call left empty
+        let v = ''
+        for (let i = latestCalls.length - 1; i >= 0; i--) {
+          const c = norm(latestCalls[i].call[h])
+          if (c) { v = c; break }
+        }
+        values[targetColumn(h)] = v
       }
-      values[targetColumn(h)] = v
-    }
 
-    let changed = false
-    for (const [header, value] of Object.entries(values)) {
-      if (!value) continue
-      const before = norm(row[header])
-      if (before === value) continue
-      highlights.set(`${rowIndex}:${header}`, kindHint[header] ?? (before ? 'updated' : 'new'))
-      row[header] = value
-      changed = true
-    }
+      let changed = false
+      for (const [header, value] of Object.entries(values)) {
+        if (!value) continue
+        const before = norm(row[header])
+        if (before === value) continue
+        highlights.set(`${rowIndex}:${header}`, kindHint[header] ?? (before ? 'updated' : 'new'))
+        row[header] = value
+        changed = true
+      }
 
-    const newNotes = formatNoteBlocks(
-      [...addedThisRun].sort((a, b) => (a.day < b.day ? 1 : a.day > b.day ? -1 : 0)),
-    )
-    preview.push({ rowIndex, id, day: latestDay, callCount: latestCalls.length, daysMerged: allDays.length, values, newNotes, changed })
+      const newNotes = formatNoteBlocks(
+        [...addedThisRun].sort((a, b) => (a.day < b.day ? 1 : a.day > b.day ? -1 : 0)),
+      )
+      preview.push({ rowIndex, id, day: latestDay, callCount: latestCalls.length, daysMerged: allDays.length, values, newNotes, changed })
+    }
+    historyDaysMerged += daysChanged.size
   }
 
   // Date/time split runs over every row, not just contacts with calls -- it is a
@@ -445,8 +462,10 @@ export function merge({ baseRows, baseHeaders, callRows, callHeaders, baseKey, c
     stats: {
       baseRows: baseRows.length,
       callRows: callRows.length,
-      contactsUpdated: preview.filter((p) => p.changed).length,
-      contactsAlreadyCurrent: preview.filter((p) => !p.changed).length,
+      // by contact, not by row -- one contact can occupy several rows
+      contactsUpdated: new Set(preview.filter((p) => p.changed).map((p) => p.id)).size,
+      contactsAlreadyCurrent: new Set(preview.filter((p) => !p.changed).map((p) => p.id)).size,
+      rowsUpdated: preview.filter((p) => p.changed).length,
       usedCalls,
       historyDaysMerged,
       noContactId,

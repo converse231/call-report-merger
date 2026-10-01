@@ -211,7 +211,7 @@ export function ResultView({ result, map, carry, projects, scope, onScope, savin
                   </thead>
                   <tbody>
                     {changed.slice(0, 100).map((p) => (
-                      <tr key={p.id}>
+                      <tr key={p.rowIndex}>
                         <td>
                           <div className="who">{nameCols.map((h) => result.rows[p.rowIndex][h]).join(' ').trim() || '—'}</div>
                           <div className="mono dim">{p.id}</div>
@@ -240,9 +240,10 @@ export function ResultView({ result, map, carry, projects, scope, onScope, savin
             )}
             {st.duplicateBaseIds.length > 0 && (
               <details>
-                <summary>{n(st.duplicateBaseIds.length)} duplicate contact IDs</summary>
+                <summary>{n(st.duplicateBaseIds.length)} contact IDs on more than one row</summary>
                 <div className="idlist">
-                  Only the last row of each was updated.{' '}
+                  Each of their rows got the same call data, so a contact listed once per project
+                  appears complete in every project’s export.{' '}
                   {st.duplicateBaseIds.map((u) => `${u.id} (${u.count}×)`).join('   ')}
                 </div>
               </details>

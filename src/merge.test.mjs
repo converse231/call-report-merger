@@ -464,4 +464,80 @@ assert.equal(r.stats.mangledCallIds, 0, 'a normal 12-digit id is not mistaken fo
   assert.deepEqual(none.get(NO_PROJECT), [0, 1])
 }
 
+
+/* ---------- one contact spread over several rows (one per project) ---------- */
+{
+  const bh = ['Record ID', 'Name', 'Associated Project']
+  const ch = ['Associated Contact IDs', 'Activity date', 'Call notes', 'Strategic Status Code']
+  const cfg = {
+    baseHeaders: bh, callHeaders: ch, baseKey: 'Record ID',
+    callKey: 'Associated Contact IDs', dateCol: 'Activity date', notesCol: 'Call notes',
+  }
+  const calls = [
+    { 'Associated Contact IDs': '111', 'Activity date': '9/8/2026 10:00', 'Call notes': 'spoke to her', 'Strategic Status Code': 'Do Not Call' },
+    { 'Associated Contact IDs': '111', 'Activity date': '8/24/2026 09:00', 'Call notes': 'left a VM', 'Strategic Status Code': '' },
+  ]
+  const dup = merge({
+    ...cfg, callRows: calls,
+    baseRows: [
+      { 'Record ID': '111', Name: 'Abby', 'Associated Project': 'Blue Coats' },
+      { 'Record ID': '111', Name: 'Abby', 'Associated Project': 'Red Team' },
+      { 'Record ID': '222', Name: 'Sam', 'Associated Project': 'Blue Coats' },
+    ],
+  })
+
+  // rows are never collapsed -- the output has exactly the rows the input had
+  assert.equal(dup.rows.length, 3)
+  // every row carrying that ID gets the data, not just the last one
+  const notes = '[2026-09-08]\nspoke to her\n\n[2026-08-24]\nleft a VM'
+  assert.equal(dup.rows[0]['Call notes'], notes)
+  assert.equal(dup.rows[1]['Call notes'], notes)
+  assert.equal(dup.rows[0]['Call Strategic Status Code'], 'Do Not Call')
+  assert.equal(dup.rows[1]['Call Strategic Status Code'], 'Do Not Call')
+  assert.equal(dup.rows[2]['Call notes'], '', 'a different contact is untouched')
+  assert.equal(dup.highlights.get('0:Call notes'), 'new')
+  assert.equal(dup.highlights.get('1:Call notes'), 'new')
+
+  // counted by contact, not by row, so the headline stays honest
+  assert.equal(dup.stats.contactsUpdated, 1)
+  assert.equal(dup.stats.rowsUpdated, 2)
+  assert.equal(dup.stats.historyDaysMerged, 2, 'two days, counted once not once per row')
+  assert.deepEqual(dup.stats.duplicateBaseIds, [{ id: '111', count: 2 }])
+
+  // each project's export carries the contact complete
+  const g = groupByProject(dup.rows, 'Associated Project')
+  assert.deepEqual([...g.keys()], ['Blue Coats', 'Red Team'])
+  for (const [, idx] of g) {
+    for (const i of idx) {
+      if (dup.rows[i]['Record ID'] === '111') assert.equal(dup.rows[i]['Call notes'], notes)
+    }
+  }
+  const blue = sliceResult(dup, g.get('Blue Coats'))
+  assert.equal(blue.rows.length, 2)
+  assert.equal(blue.highlights.get('0:Call notes'), 'new')
+
+  // preview carries one entry per row, with distinct keys for React
+  const rows111 = dup.preview.filter((p) => p.id === '111')
+  assert.equal(rows111.length, 2)
+  assert.deepEqual(rows111.map((p) => p.rowIndex), [0, 1])
+
+  // still a no-op second time
+  const twice = merge({ ...cfg, callRows: calls, baseRows: dup.rows, baseHeaders: dup.headers })
+  assert.equal(twice.highlights.size, 0)
+  assert.equal(twice.stats.contactsUpdated, 0)
+  assert.equal(twice.stats.contactsAlreadyCurrent, 1)
+
+  // the other shape: one row, projects joined by ";" (what HubSpot actually exports)
+  const joined = merge({
+    ...cfg, callRows: calls,
+    baseRows: [{ 'Record ID': '111', Name: 'Abby', 'Associated Project': 'Blue Coats;Red Team' }],
+  })
+  assert.equal(joined.rows.length, 1)
+  assert.equal(joined.rows[0]['Call notes'], notes)
+  const gj = groupByProject(joined.rows, 'Associated Project')
+  assert.deepEqual([...gj.keys()], ['Blue Coats', 'Red Team'])
+  assert.deepEqual(gj.get('Blue Coats'), [0])
+  assert.deepEqual(gj.get('Red Team'), [0])
+}
+
 console.log('all checks passed')
