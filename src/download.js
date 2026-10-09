@@ -31,11 +31,25 @@ export function downloadCsv({ headers, rows }, filename) {
  * existing cell keeps its own value, number format and column width. Nothing in
  * the base is read back and rewritten, so nothing in the base can be mangled.
  */
-export function annotateWorkbook({ headers, rows, highlights, addedHeaders, targetHeaders, source }) {
+export function annotateWorkbook({ headers, rows, highlights, addedHeaders, targetHeaders, rewrittenHeaders = [], source }) {
   const ws = source.sheet
   const cols = new Map(
     targetHeaders.filter((h) => headers.includes(h)).map((h) => [h, headers.indexOf(h) + 1]),
   )
+
+  // A base column we rewrote (the Aircall tag): only the cells that actually
+  // changed are touched, so every other cell keeps its original value and format.
+  for (const h of rewrittenHeaders) {
+    const col = headers.indexOf(h) + 1
+    if (!col) continue
+    rows.forEach((row, rowIndex) => {
+      const kind = highlights.get(`${rowIndex}:${h}`)
+      if (!kind) return
+      const cell = ws.getRow(source.sheetRowNumbers[rowIndex]).getCell(col)
+      cell.value = cellText(row[h]) || null
+      paint(cell, kind)
+    })
+  }
 
   const headerRow = ws.getRow(1)
   for (const h of addedHeaders) {

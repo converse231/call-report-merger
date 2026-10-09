@@ -4,16 +4,15 @@ export const UNKNOWN_DAY = '(no date)'
 
 /**
  * The only call columns we carry over, in the order HubSpot exports them.
- * The calls export has ~94 columns; these 8 are the report.
+ * The 2026-10 calls view dropped Strategic Status Code and Activity assigned to
+ * (the call outcome now lives in the contact's Aircall tag), so these 6 are the report.
  */
 export const DEFAULT_CALL_COLUMNS = [
   'Record ID',
-  'Activity assigned to',
   'Activity date',
   'Call duration (HH:mm:ss)',
   'Call notes',
   'Call Title',
-  'Strategic Status Code',
   'To Number',
 ]
 
@@ -142,12 +141,34 @@ export function detectNotesColumn(callHeaders) {
  */
 export const splitTargets = (col) => [`${col} (Date)`, `${col} (Time)`]
 
+// Only Create Date by default. Falling back to "any date column" silently split
+// Last Activity Date once Create Date left the export, which nobody asked for.
 export function detectSplitDateColumn(baseHeaders) {
-  return (
-    baseHeaders.find((h) => /^create\s*date$/i.test(h)) ??
-    baseHeaders.find((h) => /date/i.test(h) && !splitTargets('').some((s) => h.endsWith(s.trim()))) ??
-    ''
-  )
+  return baseHeaders.find((h) => /^create\s*date$/i.test(h)) ?? ''
+}
+
+export function detectTagColumn(baseHeaders) {
+  return baseHeaders.find((h) => /aircall\s*tags?/i.test(h)) ?? ''
+}
+
+/**
+ * "A - Answering Machine" -> "A". The code is whatever sits before the first
+ * " - "; a tag with no code ("Not Qualified") is kept as written so nothing is
+ * lost. Several tags joined with ";" are each shortened. Already-short codes
+ * pass through untouched, so re-running on a merged file changes nothing.
+ */
+export function aircallCode(value) {
+  const text = cellText(value)
+  if (!text) return ''
+  return text
+    .split(';')
+    .map((part) => {
+      const t = part.trim()
+      const m = t.match(/^([A-Za-z0-9]{1,6})\s*[-–—]\s+\S/)
+      return m ? m[1] : t
+    })
+    .filter(Boolean)
+    .join(';')
 }
 
 export function detectProjectColumn(baseHeaders) {
@@ -286,13 +307,16 @@ function fitToCell(blocks) {
  * into the notes history, and fill every other call column with the latest
  * non-empty value from that day.
  */
-export function merge({ baseRows, baseHeaders, callRows, callHeaders, baseKey, callKey, dateCol, notesCol, carryColumns, splitDateColumns }) {
+export function merge({ baseRows, baseHeaders, callRows, callHeaders, baseKey, callKey, dateCol, notesCol, carryColumns, splitDateColumns, tagColumns }) {
   const wanted = new Set(carryColumns ?? defaultCarryColumns(callHeaders, callKey))
   const carried = callHeaders.filter((h) => h !== callKey && wanted.has(h))
   // Only split base columns that exist, and never a split column we made earlier.
   const splitCols = (splitDateColumns ?? [])
     .filter((c) => c && baseHeaders.includes(c) && !/ \((Date|Time)\)$/.test(c))
   const splitCells = splitCols.flatMap(splitTargets)
+  // Existing base columns rewritten in place -- the one exception to "never touch
+  // a base column", asked for explicitly so the tag reads as its code only.
+  const tagCols = (tagColumns ?? []).filter((c) => c && baseHeaders.includes(c))
 
   const newHeaders = [...baseHeaders]
   for (const t of [...carried.map(targetColumn), ...splitCells]) {
@@ -439,6 +463,18 @@ export function merge({ baseRows, baseHeaders, callRows, callHeaders, baseKey, c
     historyDaysMerged += daysChanged.size
   }
 
+  let tagsCoded = 0
+  for (const col of tagCols) {
+    rows.forEach((row, i) => {
+      const before = cellText(row[col])
+      const code = aircallCode(row[col])
+      if (code === before) return
+      row[col] = code
+      highlights.set(`${i}:${col}`, 'updated') // amber: a value of theirs was replaced
+      tagsCoded++
+    })
+  }
+
   // Date/time split runs over every row, not just contacts with calls -- it is a
   // view of a base column, not call data.
   for (const col of splitCols) {
@@ -456,6 +492,8 @@ export function merge({ baseRows, baseHeaders, callRows, callHeaders, baseKey, c
     headers: newHeaders,
     addedHeaders,
     targetHeaders: [...carried.map(targetColumn), ...splitCells],
+    // base columns that were rewritten: only their changed cells get written back
+    rewrittenHeaders: tagCols,
     rows,
     highlights,
     preview: preview.sort((a, b) => (a.day < b.day ? 1 : a.day > b.day ? -1 : 0)),
@@ -475,6 +513,7 @@ export function merge({ baseRows, baseHeaders, callRows, callHeaders, baseKey, c
       mangledCallIds: unmatchedList.filter((u) => MANGLED_ID.test(u.id)).length,
       mangledBaseIds,
       notesTrimmed,
+      tagsCoded,
       duplicateBaseIds: [...duplicateIds.entries()].map(([id, count]) => ({ id, count })),
     },
   }

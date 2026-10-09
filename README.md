@@ -17,18 +17,20 @@ The calls file's own `Record ID` is the *call's* ID, not the contact's. Note the
 94-column export also has `Associated Contact create attribution IDs`, which is
 a different thing — detection prefers the exact name.
 
-Only 8 of the calls export's ~94 columns are carried, appended with a `Call ` prefix:
+Only the standard 6 call columns are carried, appended with a `Call ` prefix:
 
 | From the calls export | Added to the base as |
 |---|---|
 | `Record ID` | `Call Record ID` |
-| `Activity assigned to` | `Call Activity assigned to` |
 | `Activity date` | `Call Activity date` |
 | `Call duration (HH:mm:ss)` | `Call duration (HH:mm:ss)` |
 | `Call notes` | `Call notes` |
 | `Call Title` | `Call Title` |
-| `Strategic Status Code` | `Call Strategic Status Code` |
 | `To Number` | `Call To Number` |
+
+`Strategic Status Code` and `Activity assigned to` left the standard set with the
+2026-10 calls view — the call outcome now lives in the contact's Aircall tag. An
+older export that still has them can tick them back on under **Change**.
 
 The UI shows these as chips so you can verify — or change — the selection per run.
 
@@ -53,10 +55,27 @@ For each contact:
    rest hold the latest value, not a history.
 4. Results are appended as new `Call …` columns.
 
+## Aircall tags shortened to their code
+
+If the contacts file has a `Last used Aircall tags` column, each value is cut down
+to the code in front of its first ` - `:
+
+| Tag | Becomes |
+|---|---|
+| `A - Answering Machine` | `A` |
+| `A - Answering Machine;B - Busy` | `A;B` |
+| `Not Qualified` | `Not Qualified` — no code, kept as written |
+
+This is the **one place the app changes an existing column**, done in place because
+the code is all that's wanted. Only cells whose value actually changes are rewritten
+(and highlighted amber); every other cell in that column keeps its own value and
+formatting. Already-short codes pass through, so re-running is a no-op. Turn it off
+or point it at another column under **Change**.
+
 ## Splitting a date column
 
 A HubSpot timestamp like `2026-09-09 07:49` is unfilterable in Excel — 3,102 contacts
-produce ~2,900 distinct values. Pick a base column in step 2 (defaults to `Create Date`)
+produce ~2,900 distinct values. Pick a base column under **Change** (defaults to `Create Date` when the export has it, otherwise off)
 and two text columns are appended beside it:
 
 | | |

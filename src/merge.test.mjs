@@ -6,6 +6,7 @@ import {
   merge, parseWhen, cellText, targetColumn, defaultCarryColumns,
   mergeNoteHistory, parseNoteBlocks, wasTrimmed,
   splitTargets, detectSplitDateColumn, detectProjectColumn, groupByProject, sliceResult, NO_PROJECT,
+  aircallCode, detectTagColumn,
   detectBaseKeyColumn, detectCallKeyColumn, detectDateColumn, detectNotesColumn,
 } from './merge.js'
 import { readTable } from './readTable.js'
@@ -44,18 +45,25 @@ assert.equal(targetColumn('Call notes'), 'Call notes')
 assert.equal(targetColumn('Activity date'), 'Call Activity date')
 assert.equal(targetColumn(targetColumn('Activity date')), 'Call Activity date')
 
-/* ---------- the whitelist: 94 columns in, 8 out ---------- */
+/* ---------- the whitelist: wide export in, the standard 6 out ---------- */
 const WIDE = [...NEAR_MISSES, 'Activity assigned to', 'Call duration (HH:mm:ss)', 'Call Title',
   'Strategic Status Code', 'To Number', 'Recording URL', 'Owner talk speed']
+// Strategic Status Code and Activity assigned to left the standard set with the
+// 2026-10 calls view; an older export that still has them doesn't carry them by default
 assert.deepEqual(defaultCarryColumns(WIDE, 'Associated Contact IDs'), [
-  'Record ID', 'Activity date', 'Call notes', 'Activity assigned to',
-  'Call duration (HH:mm:ss)', 'Call Title', 'Strategic Status Code', 'To Number',
+  'Record ID', 'Activity date', 'Call notes',
+  'Call duration (HH:mm:ss)', 'Call Title', 'To Number',
 ])
 // an export missing one standard column just drops it -- no silent fallback to all 94
-const NO_STATUS = WIDE.filter((h) => h !== 'Strategic Status Code')
-assert.deepEqual(defaultCarryColumns(NO_STATUS, 'Associated Contact IDs'), [
-  'Record ID', 'Activity date', 'Call notes', 'Activity assigned to',
-  'Call duration (HH:mm:ss)', 'Call Title', 'To Number',
+const NO_TITLE = WIDE.filter((h) => h !== 'Call Title')
+assert.deepEqual(defaultCarryColumns(NO_TITLE, 'Associated Contact IDs'), [
+  'Record ID', 'Activity date', 'Call notes', 'Call duration (HH:mm:ss)', 'To Number',
+])
+// the exact 2026-10 calls view: all 6 standard columns, nothing else carried
+const OCT_VIEW = ['Record ID', 'Call Title', 'Call duration (HH:mm:ss)', 'Activity date', 'Call direction',
+  'Associated Contact', 'Associated Project', 'To Number', 'Call notes', 'Associated Contact IDs', 'Associated Project IDs']
+assert.deepEqual(defaultCarryColumns(OCT_VIEW, 'Associated Contact IDs'), [
+  'Record ID', 'Call Title', 'Call duration (HH:mm:ss)', 'Activity date', 'To Number', 'Call notes',
 ])
 // an export with none of the known names falls back to carrying everything
 assert.deepEqual(defaultCarryColumns(['id', 'when', 'memo'], 'id'), ['when', 'memo'])
@@ -76,7 +84,9 @@ const callRows = [
   { 'Associated Contact IDs': '222;999', 'Activity date': '8/5/2026 09:00', 'Call notes': '', 'Strategic Status Code': 'Fax' },
   { 'Associated Contact IDs': '', 'Activity date': '8/5/2026 09:00', 'Call notes': 'orphan', 'Strategic Status Code': '' },
 ]
-const opts = { baseRows, baseHeaders, callRows, callHeaders, baseKey: 'Record ID', callKey: 'Associated Contact IDs', dateCol: 'Activity date', notesCol: 'Call notes' }
+// carryColumns is explicit: these tests exercise "latest value wins" on Strategic
+// Status Code, which is no longer part of the default set
+const opts = { baseRows, baseHeaders, callRows, callHeaders, baseKey: 'Record ID', callKey: 'Associated Contact IDs', dateCol: 'Activity date', notesCol: 'Call notes', carryColumns: ['Activity date', 'Call notes', 'Strategic Status Code'] }
 const r = merge(opts)
 
 assert.deepEqual(r.addedHeaders, ['Call Activity date', 'Call notes', 'Call Strategic Status Code'])
@@ -115,6 +125,7 @@ assert.equal(again.highlights.size, 0)
 // all five must survive, only the latest feeds the non-notes columns
 const fiveDays = merge({
   baseHeaders, baseKey: 'Record ID', callHeaders, callKey: 'Associated Contact IDs', dateCol: 'Activity date', notesCol: 'Call notes',
+  carryColumns: opts.carryColumns,
   baseRows: [{ 'Record ID': '111', 'First Name': 'Abby' }],
   callRows: [
     { 'Associated Contact IDs': '111', 'Activity date': '8/3/2026 17:06', 'Call notes': 'Voicemail', 'Strategic Status Code': '' },
@@ -472,6 +483,7 @@ assert.equal(r.stats.mangledCallIds, 0, 'a normal 12-digit id is not mistaken fo
   const cfg = {
     baseHeaders: bh, callHeaders: ch, baseKey: 'Record ID',
     callKey: 'Associated Contact IDs', dateCol: 'Activity date', notesCol: 'Call notes',
+    carryColumns: ['Activity date', 'Call notes', 'Strategic Status Code'],
   }
   const calls = [
     { 'Associated Contact IDs': '111', 'Activity date': '9/8/2026 10:00', 'Call notes': 'spoke to her', 'Strategic Status Code': 'Do Not Call' },
@@ -538,6 +550,82 @@ assert.equal(r.stats.mangledCallIds, 0, 'a normal 12-digit id is not mistaken fo
   assert.deepEqual([...gj.keys()], ['Blue Coats', 'Red Team'])
   assert.deepEqual(gj.get('Blue Coats'), [0])
   assert.deepEqual(gj.get('Red Team'), [0])
+}
+
+
+/* ---------- Aircall tag shortened to its code ---------- */
+{
+  assert.equal(aircallCode('A - Answering Machine'), 'A')
+  assert.equal(aircallCode('A - Anwering Machine'), 'A', "HubSpot's own typo still yields the code")
+  assert.equal(aircallCode('DNC - Do Not Call'), 'DNC')
+  assert.equal(aircallCode('  B -  Busy line '), 'B')
+  assert.equal(aircallCode('A - Answering Machine;B - Busy'), 'A;B')
+  assert.equal(aircallCode('Not Qualified'), 'Not Qualified', 'no code: kept as written')
+  assert.equal(aircallCode('Follow-up needed'), 'Follow-up needed', 'a hyphenated word is not a code')
+  assert.equal(aircallCode('A'), 'A', 'already a code: unchanged, so re-runs are no-ops')
+  assert.equal(aircallCode(''), '')
+  assert.equal(aircallCode(null), '')
+
+  assert.equal(detectTagColumn(['Record ID', 'Last used Aircall tags']), 'Last used Aircall tags')
+  assert.equal(detectTagColumn(['Record ID', 'Email']), '')
+  // Create Date left the 2026-10 contacts view; the split must not silently move to another date
+  assert.equal(detectSplitDateColumn(['Record ID', 'Last Activity Date', 'Appointment Date']), '')
+
+  const tagBase = [
+    { 'Record ID': '111', 'Last used Aircall tags': 'A - Anwering Machine' },
+    { 'Record ID': '222', 'Last used Aircall tags': 'Not Qualified' },
+    { 'Record ID': '333', 'Last used Aircall tags': '' },
+  ]
+  const tagCfg = {
+    baseHeaders: ['Record ID', 'Last used Aircall tags'], baseKey: 'Record ID',
+    callHeaders: ['Associated Contact IDs', 'Activity date', 'Call notes'],
+    callKey: 'Associated Contact IDs', dateCol: 'Activity date', notesCol: 'Call notes',
+    tagColumns: ['Last used Aircall tags'],
+  }
+  const tg = merge({ ...tagCfg, baseRows: tagBase, callRows: [] })
+  // rewritten in place, every row -- not just contacts that had calls
+  assert.deepEqual(tg.rows.map((x) => x['Last used Aircall tags']), ['A', 'Not Qualified', ''])
+  assert.ok(!tg.headers.some((h) => /code/i.test(h)), 'no extra column: the tag column itself changes')
+  assert.equal(tg.highlights.get('0:Last used Aircall tags'), 'updated', 'a replaced value shows amber')
+  assert.equal(tg.highlights.get('1:Last used Aircall tags'), undefined, 'unchanged cells are not flagged')
+  assert.equal(tg.stats.tagsCoded, 1)
+  assert.deepEqual(tg.rewrittenHeaders, ['Last used Aircall tags'])
+  assert.equal(tagBase[0]['Last used Aircall tags'], 'A - Anwering Machine', 'the input rows are not mutated')
+
+  // re-running on the merged output changes nothing
+  const tg2 = merge({ ...tagCfg, baseRows: tg.rows, callRows: [] })
+  assert.equal(tg2.stats.tagsCoded, 0)
+  assert.equal(tg2.highlights.size, 0)
+
+  // switched off: tags pass through untouched
+  const off = merge({ ...tagCfg, tagColumns: [''], baseRows: tagBase, callRows: [] })
+  assert.equal(off.rows[0]['Last used Aircall tags'], 'A - Anwering Machine')
+
+  // into a real workbook: only the changed tag cell is rewritten; its neighbours keep their own value
+  const wb = new ExcelJS.Workbook()
+  const ws = wb.addWorksheet('Contacts')
+  ws.addRow(['Record ID', 'Last used Aircall tags']).commit()
+  ws.addRow([111, 'A - Anwering Machine']).commit()
+  const keep = ws.addRow([222, 'Not Qualified'])
+  keep.getCell(2).font = { bold: true } // a formatting choice of theirs that must survive
+  keep.commit()
+  const buf = await wb.xlsx.writeBuffer()
+  const xBase = await readTable({ name: 'tags.xlsx', arrayBuffer: async () => buf })
+  const xr = merge({ ...tagCfg, baseRows: xBase.rows, baseHeaders: xBase.headers, callRows: [] })
+  const out = 'src/.tags.tmp.xlsx'
+  await annotateWorkbook({ ...xr, source: xBase }).xlsx.writeFile(out)
+  const back = new ExcelJS.Workbook(); await back.xlsx.readFile(out)
+  const bws = back.worksheets[0]
+  assert.equal(bws.getRow(2).getCell(2).value, 'A')
+  assert.equal(bws.getRow(2).getCell(2).fill?.fgColor?.argb, 'FFFDE9B8', 'amber on the replaced tag')
+  assert.equal(bws.getRow(3).getCell(2).value, 'Not Qualified')
+  assert.equal(bws.getRow(3).getCell(2).font?.bold, true, 'an untouched tag cell keeps its formatting')
+  assert.equal(bws.getRow(3).getCell(2).fill?.fgColor?.argb, undefined)
+  assert.equal(bws.getRow(2).getCell(1).value, 111, 'other base columns untouched')
+  fs.unlinkSync(out)
+
+  // and a project subset / CSV path carries the shortened tag too
+  assert.equal(sliceResult(tg, [0]).rows[0]['Last used Aircall tags'], 'A')
 }
 
 console.log('all checks passed')

@@ -2,7 +2,7 @@ import React, { useEffect, useMemo, useRef, useState } from 'react'
 import {
   merge, targetColumn, defaultCarryColumns, DEFAULT_CALL_COLUMNS, parseNoteBlocks,
   detectBaseKeyColumn, detectCallKeyColumn, detectDateColumn, detectNotesColumn,
-  detectSplitDateColumn, detectProjectColumn, groupByProject, sliceResult, splitTargets, NO_PROJECT,
+  detectSplitDateColumn, detectProjectColumn, detectTagColumn, aircallCode, groupByProject, sliceResult, splitTargets, NO_PROJECT,
 } from './merge.js'
 import { readTable } from './readTable.js'
 import { downloadCsv, downloadXlsx } from './download.js'
@@ -231,6 +231,7 @@ export function ResultView({ result, map, carry, projects, scope, onScope, savin
             <span>{n(st.baseRows)} contacts in file</span>
             <span>{n(st.usedCalls)} calls read</span>
             {st.contactsAlreadyCurrent > 0 && <span>{n(st.contactsAlreadyCurrent)} already up to date</span>}
+            {st.tagsCoded > 0 && <span>{n(st.tagsCoded)} {st.tagsCoded === 1 ? 'tag' : 'tags'} shortened to {st.tagsCoded === 1 ? 'its code' : 'codes'}</span>}
             {st.noContactId > 0 && <span>{n(st.noContactId)} calls with no contact</span>}
             {st.unmatched.length > 0 && (
               <details>
@@ -264,7 +265,7 @@ export default function App() {
   const [callFiles, setCallFiles] = useState([])
   const [errors, setErrors] = useState({})
   const [loading, setLoading] = useState({})
-  const [map, setMap] = useState({ baseKey: '', callKey: '', dateCol: '', notesCol: '', splitCol: '', projectCol: '' })
+  const [map, setMap] = useState({ baseKey: '', callKey: '', dateCol: '', notesCol: '', splitCol: '', projectCol: '', tagCol: '' })
   const [carry, setCarry] = useState([])
   const [scope, setScope] = useState('')
   const [tuning, setTuning] = useState(false)
@@ -291,6 +292,7 @@ export default function App() {
           ...m,
           baseKey: detectBaseKeyColumn(t.headers),
           splitCol: detectSplitDateColumn(t.headers),
+          tagCol: detectTagColumn(t.headers),
           projectCol: detectProjectColumn(t.headers),
         }))
       } else {
@@ -328,6 +330,7 @@ export default function App() {
     const highlights = new Map()
     let addedHeaders = []
     let targetHeaders = []
+    let rewrittenHeaders = []
     let last = null
 
     for (const t of callFiles) {
@@ -342,16 +345,18 @@ export default function App() {
         notesCol: has(t, map.notesCol, detectNotesColumn),
         carryColumns: picked.length ? picked : defaultCarryColumns(t.headers, callKey),
         splitDateColumns: [map.splitCol],
+        tagColumns: [map.tagCol],
       })
       rows = r.rows
       headers = r.headers
       for (const [k, v] of r.highlights) highlights.set(k, v)
       addedHeaders = [...new Set([...addedHeaders, ...r.addedHeaders])]
       targetHeaders = [...new Set([...targetHeaders, ...r.targetHeaders])]
+      rewrittenHeaders = [...new Set([...rewrittenHeaders, ...r.rewrittenHeaders])]
       last = r
     }
     return {
-      ...last, rows, headers, highlights, addedHeaders, targetHeaders,
+      ...last, rows, headers, highlights, addedHeaders, targetHeaders, rewrittenHeaders,
       source: base.workbook ? base : null,
     }
   }, [base, callFiles, map, carry])
@@ -446,6 +451,7 @@ export default function App() {
             <p className="tune-say">
               Adding <strong>{carry.length}</strong> call {carry.length === 1 ? 'column' : 'columns'}
               {map.splitCol && <>, splitting <strong>{map.splitCol}</strong> into date + time</>}
+              {map.tagCol && <>, shortening <strong>{map.tagCol}</strong> to its code</>}
               , matching on <strong>{map.callKey || '?'}</strong> → <strong>{map.baseKey || '?'}</strong>.
             </p>
             <button className="ghost" onClick={() => setTuning((v) => !v)}>
@@ -482,6 +488,20 @@ export default function App() {
                       ? `Adds ${splitTargets(map.splitCol).join(' and ')}, leaving the original alone`
                       : 'A timestamp like 2026-09-09 07:49 is almost unfilterable in Excel'}
                     onChange={(v) => setMap((m) => ({ ...m, splitCol: v }))}
+                  />
+                </div>
+              </div>
+
+              <div className="tune-group">
+                <h3>Shorten a tag column to its code</h3>
+                <div className="fields">
+                  <Field
+                    label="Tag column" value={map.tagCol} options={base.headers}
+                    noneLabel="— leave tags as they are —"
+                    note={map.tagCol
+                      ? `“A - Answering Machine” becomes “${aircallCode('A - Answering Machine')}”. Tags without a code, like “Not Qualified”, stay as written.`
+                      : 'Keeps only the code at the front of an Aircall tag'}
+                    onChange={(v) => setMap((m) => ({ ...m, tagCol: v }))}
                   />
                 </div>
               </div>
